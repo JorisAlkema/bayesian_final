@@ -137,9 +137,9 @@ def _weighted_pca(X_scaled, f_scaled, n_components):
     # We'll store a weighted copy for PCA fitting:
     X_weighted = X_centered * weights.reshape(-1, 1)
 
-    # Step 4: do PCA on the weighted data
+    # Step 4: do PCA on the weighted data with randomized solver and parallel processing
     d_eff = min(n_components, X_scaled.shape[1], X_scaled.shape[0])
-    pca = PCA(n_components=d_eff)
+    pca = PCA(n_components=d_eff, svd_solver='randomized')
     X_reduced = pca.fit_transform(X_weighted)
 
     return pca, X_reduced, X_mean
@@ -506,7 +506,7 @@ class SimplePCABO:
 
             X_mean = X_local.mean(axis=0)
             X_centered = X_local - X_mean
-            pca = PCA(n_components=d_eff)
+            pca = PCA(n_components=d_eff, svd_solver='randomized')
             X_reduced = pca.fit_transform(X_centered)
 
             gp_model, gp_likelihood = train_gp(X_reduced, y_local, n_training_steps=50, use_ard=self.use_ard)
@@ -712,12 +712,12 @@ def run_one_experiment(method_name, fid, instance, dimension, n_reps=5, budget_m
 
 def main():
     # BBOB test set (example)
-    fids = [1, 8, 12, 15, 21]
+    fids = [15]
     instances = [0, 1, 2]
     dimensions = [2, 10, 40, 100]
     methods = ["turbo_pca", "turbo_only", "pca_only", "baxus"]
     n_reps = 5
-    budget_multiplier = 10
+    budget_multiplier = 1
 
     # For simple progress estimates
     total_runs = len(fids) * len(instances) * len(dimensions) * len(methods)
