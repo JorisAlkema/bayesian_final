@@ -838,7 +838,7 @@ def main():
     plt.ylabel("Average Runtime (s)")
     plt.title("Runtime Comparison Across Methods (All Problems)")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("runtime_comparison.png")
 
 
 if __name__ == "__main__":
