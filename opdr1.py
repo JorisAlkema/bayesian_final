@@ -411,46 +411,59 @@ class SimplePCABO:
         while self.n_evals < self.max_evals:
             X_local = self.X
             y_local = self.fX.ravel()
-            d_eff = min(self.pca_components, X_local.shape[0], self.dim)
 
-            X_mean = X_local.mean(axis=0)
-            X_centered = X_local - X_mean
-            pca = PCA(n_components=d_eff, svd_solver='randomized')
-            X_reduced = pca.fit_transform(X_centered)
+            d_eff = min(self.pca_components, X_local.shape[1], X_local.shape[0])
 
+            # Weighted PCA instead of plain PCA
+            X_scaled = (X_local - self.lb) / (self.ub - self.lb)  # or do a 0-1 scaling if you wish
+            pca, X_reduced, X_mean = _weighted_pca(
+                X_scaled,  # the scaled design
+                y_local,   # function values for weighting
+                d_eff
+            )
+
+            # Now train the GP in the (weighted) PCA space
             gp_model, gp_likelihood = train_gp(
                 X_reduced,
                 y_local,
-                n_training_steps=50,  # unchanged
+                n_training_steps=50,
                 use_ard=self.use_ard
             )
 
+            # Generate candidate points in the reduced space
             n_candidates = min(50 * d_eff, 2500)
             sobol = SobolEngine(d_eff, scramble=True, seed=np.random.randint(1e6))
             Z = sobol.draw(n_candidates).numpy() * 2.0 - 1.0
 
+            # Predict from the GP
             gp_model.eval()
             gp_likelihood.eval()
-            Z_torch = torch.tensor(Z, dtype=torch.float32)
             with torch.no_grad():
+                Z_torch = torch.tensor(Z, dtype=torch.float32)
                 dist = gp_likelihood(gp_model(Z_torch))
                 f_samps = dist.sample(torch.Size([1])).numpy().reshape(-1)
 
-            acq_vals = -f_samps
-            idx_top = np.argsort(-acq_vals)[: self.batch_size]
+            # A simple “EI‐like” approach is to pick those with the smallest predicted f-value 
+            # or highest negative f_samps:
+            idx_top = np.argsort(f_samps)[: self.batch_size]
+
             Z_next = Z[idx_top]
-            X_centered_next = pca.inverse_transform(Z_next)
-            X_next = X_centered_next + X_mean
 
-            fX_next = []
-            for xx in X_next:
-                fX_next.append(self.f(xx))
-            fX_next = np.array(fX_next).reshape(-1,1)
+            # Map back from PCA space to original dimension
+            # In your code you use `_apply_pca_unweighted(...)`. For example:
+            X_scaled_next = _apply_pca_unweighted(Z_next, pca, X_mean)
+            # Then unscale back to [lb, ub]
+            X_next = X_scaled_next * (self.ub - self.lb) + self.lb
 
+            # Evaluate
+            fX_next = np.array([self.f(xi) for xi in X_next]).reshape(-1, 1)
+
+            # Store them
             self.X = np.vstack([self.X, X_next])
             self.fX = np.vstack([self.fX, fX_next])
             self.n_evals += self.batch_size
 
+            # Track best
             mbest = np.min(fX_next)
             if mbest < self.best_f:
                 self.best_f = float(mbest)
@@ -459,6 +472,7 @@ class SimplePCABO:
             if self.n_evals >= self.max_evals:
                 break
         return self.best_x, self.best_f
+
 
 
 # =============== AxUS & BAXUS placeholders ===============
