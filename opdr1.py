@@ -23,6 +23,7 @@ from scipy.stats import rankdata
 import matplotlib.pyplot as plt
 from ioh import get_problem
 from ioh import logger as ioh_logger
+from scipy.stats import qmc
 
 # ====================== SHARED HYPERPARAMETERS =====================
 SHARED_PARAMS = {
@@ -43,7 +44,7 @@ SHARED_PARAMS = {
     # Candidate set
     # We often do: n_cand = min(50*d, 2500). We'll keep that logic inside each class.
     # BAXUS-specific
-    "baxus_train_interval": 10,  # Only train GP every 10 steps
+    "baxus_train_interval": 5,  # Only train GP every 10 steps
     "baxus_fail_tol_factor": 4.0,
     "baxus_init_target_dim": 5,
     "baxus_seed": 0,
@@ -136,10 +137,15 @@ def _apply_pca_unweighted(X_scaled, pca, X_mean):
     return X_reduced
 
 
-# ========== Combined TuRBO + Weighted PCA (LOCAL PCA) ==========
+def latin_hypercube(n_samples, dim):
+    sampler = qmc.LatinHypercube(d=dim)
+    sample = sampler.random(n=n_samples)
+    return sample
+
+# ================== Corrected TuRBO_PCA_BO Class with Proper Restart Mechanism ==================
 
 class TuRBO_PCA_BO:
-    def __init__(self, f, lb, ub, hyperparams):
+    def __init__(self, f, lb, ub, hyperparams, verbose=False):
         self.f = f
         self.lb = lb
         self.ub = ub
@@ -151,7 +157,7 @@ class TuRBO_PCA_BO:
         self.batch_size = hyperparams["batch_size"]
         self.use_ard = hyperparams["use_ard"]
         self.pca_components = hyperparams["pca_components"]
-        self.length = hyperparams["length_init"]
+        self.length_init = hyperparams["length_init"]
         self.length_min = hyperparams["length_min"]
         self.length_max = hyperparams["length_max"]
         self.success_tol = hyperparams["success_tol"]
@@ -167,11 +173,24 @@ class TuRBO_PCA_BO:
         self.success_count = 0
         self.fail_count = 0
 
-        # Candidate set size
-        self.n_cand = min(50 * self.dim, 2500)
+        # Candidate set size    
+        self.n_cand = min(100 * self.dim, 2500)
 
-    def initialize(self):
-        X_init = np.random.uniform(self.lb, self.ub, size=(self.n_init, self.dim))
+        # Current trust region length
+        self.length = self.length_init
+
+        # Verbosity
+        self.verbose = verbose
+
+    def initialize(self, restart=True):
+        if restart:
+            # Restart: Sample new initial points randomly across the entire search space
+            X_init = latin_hypercube(self.n_init, self.dim)
+            X_init = from_unit_cube(X_init, self.lb, self.ub)
+        else:
+            # Initial initialization: Random uniform sampling
+            X_init = np.random.uniform(self.lb, self.ub, size=(self.n_init, self.dim))
+
         f_init = []
         for x in X_init:
             f_init.append(self.f(x))
@@ -182,23 +201,37 @@ class TuRBO_PCA_BO:
         self.n_evals += self.n_init
 
         idx_best = np.argmin(self.fX)
-        self.best_f = float(self.fX[idx_best, 0])
-        self.best_x = self.X[idx_best].copy()
+        if self.fX[idx_best, 0] < self.best_f:
+            self.best_f = float(self.fX[idx_best, 0])
+            self.best_x = self.X[idx_best].copy()
+
+        if self.verbose:
+            print(f"{'Restarting' if restart else 'Initializing'} with {self.n_init} points. Best f: {self.best_f:.4f}")
 
     def _update_trust_region(self, fX_batch):
         if np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f):
             self.success_count += 1
             self.fail_count = 0
+            if self.verbose:
+                print(f"Success count increased to {self.success_count}")
         else:
             self.fail_count += 1
             self.success_count = 0
+            if self.verbose:
+                print(f"Fail count increased to {self.fail_count}")
 
         if self.success_count >= self.success_tol:
+            old_length = self.length
             self.length = min(self.length * 2.0, self.length_max)
             self.success_count = 0
+            if self.verbose:
+                print(f"Expanding trust region from {old_length:.4f} to {self.length:.4f}")
         if self.fail_count >= self.fail_tol:
+            old_length = self.length
             self.length = max(self.length / 2.0, self.length_min)
             self.fail_count = 0
+            if self.verbose:
+                print(f"Shrinking trust region from {old_length:.4f} to {self.length:.4f}")
 
     def _create_candidates(self, X_scaled, f_scaled):
         i_best = np.argmin(f_scaled)
@@ -222,17 +255,18 @@ class TuRBO_PCA_BO:
         gp_model, gp_likelihood = train_gp(
             X_reduced_local,
             f_local.ravel(),
-            n_training_steps=50,  # unchanged
-            use_ard=self.use_ard
+            n_training_steps=50,  # You can make this a hyperparameter if desired
+            use_ard=self.use_ard,
+            lr=0.05  # Use the learning rate from shared hyperparams
         )
 
-        # Candidate set
+        # Generate candidate points using Sobol sequence
         seed = np.random.randint(int(1e6))
         sobol = SobolEngine(self.dim, scramble=True, seed=seed)
         pert = sobol.draw(self.n_cand).numpy()
         X_cand = lb_tr + (ub_tr - lb_tr) * pert
 
-        # Probability-based perturbation
+        # Apply probability-based perturbation
         prob_perturb = min(20.0 / self.dim, 1.0)
         mask = np.random.rand(self.n_cand, self.dim) <= prob_perturb
         row_sum = np.sum(mask, axis=1)
@@ -258,116 +292,265 @@ class TuRBO_PCA_BO:
         best_inds = idx_sorted[: self.batch_size]
         return X_cand[best_inds]
 
+    def _restart_condition(self):
+        """Check if a restart is needed based on the current trust region size."""
+        return self.length <= self.length_min and self.n_evals < self.max_evals
+
     def optimize(self):
-        self.initialize()
-        while self.n_evals < self.max_evals and self.length > self.length_min:
-            X_scaled = to_unit_cube(self.X, self.lb, self.ub)
-            f_scaled = self.fX.ravel()
+        # Initial optimization
+        self.length = self.length_init
+        self.initialize(restart=False)
 
-            X_next_scaled = self._create_candidates(X_scaled, f_scaled)
-            X_next = from_unit_cube(X_next_scaled, self.lb, self.ub)
+        while self.n_evals < self.max_evals:
+            while self.n_evals < self.max_evals and self.length > self.length_min:
+                # Scale X to unit cube
+                X_scaled = to_unit_cube(self.X, self.lb, self.ub)
+                f_scaled = self.fX.ravel()
 
-            fX_next = []
-            for xnew in X_next:
-                fX_next.append(self.f(xnew))
-            fX_next = np.array(fX_next).reshape(-1, 1)
+                # Generate next candidates
+                X_next_scaled = self._create_candidates(X_scaled, f_scaled)
+                X_next = from_unit_cube(X_next_scaled, self.lb, self.ub)
 
-            self.X = np.vstack([self.X, X_next])
-            self.fX = np.vstack([self.fX, fX_next])
-            self.n_evals += self.batch_size
+                # Evaluate new points
+                fX_next = []
+                for xnew in X_next:
+                    fX_next.append(self.f(xnew))
+                fX_next = np.array(fX_next).reshape(-1, 1)
 
-            min_batch = np.min(fX_next)
-            if min_batch < self.best_f:
-                self.best_f = float(min_batch)
-                self.best_x = X_next[np.argmin(fX_next)].copy()
+                # Update data
+                self.X = np.vstack([self.X, X_next])
+                self.fX = np.vstack([self.fX, fX_next])
+                self.n_evals += self.batch_size
 
-            self._update_trust_region(fX_next)
+                # Update best found point
+                min_batch = np.min(fX_next)
+                if min_batch < self.best_f:
+                    self.best_f = float(min_batch)
+                    self.best_x = X_next[np.argmin(fX_next)].copy()
+                    if self.verbose:
+                        print(f"New best f: {self.best_f:.4f}")
+
+                # Update trust region
+                self._update_trust_region(fX_next)
+
+            # Check if restart is needed
+            if self._restart_condition():
+                if self.verbose:
+                    print(f"Restarting TuRBO: {self.n_evals}/{self.max_evals} evaluations used.")
+                # Restart by sampling new points across the entire search space
+                self.initialize(restart=True)
+                # Reset trust region length
+                self.length = self.length_init
+            else:
+                break  # No more evaluations or cannot restart
 
         return self.best_x, self.best_f
 
 
-# =============== Standalone TuRBO (single TR) ===============
+
+
+# =============== Corrected Standalone TuRBO (TurboOnly) with Proper Restart Mechanism ===============
 
 class TurboOnly:
-    def __init__(self, f, lb, ub, hyperparams):
+    def __init__(self, f, lb, ub, hyperparams, verbose=False):
         self.f = f
         self.lb = lb
         self.ub = ub
         self.dim = len(lb)
 
-        # Unpack
+        # Unpack shared hyperparams
         self.n_init = hyperparams["n_init"]
         self.max_evals = hyperparams["max_evals"]
         self.batch_size = hyperparams["batch_size"]
-        self.length = hyperparams["length_init"]
+        self.length_init = hyperparams["length_init"]
         self.length_min = hyperparams["length_min"]
         self.length_max = hyperparams["length_max"]
         self.success_tol = hyperparams["success_tol"]
         self.fail_tol = hyperparams["fail_tol"]
 
+        # Data storage
+        self.X = np.zeros((0, self.dim))
+        self.fX = np.zeros((0, 1))
+        self.best_x = None
+        self.best_f = float('inf')
+        self.n_evals = 0
+
         self.success_count = 0
         self.fail_count = 0
 
-        self.X = np.zeros((0, self.dim))
-        self.fX = np.zeros((0,1))
-        self.n_evals = 0
-        self.best_f = float('inf')
-        self.best_x = None
+        # Candidate set size
+        self.n_cand = min(100 * self.dim, 2500)
 
-    def _initialize(self):
-        X_init = np.random.uniform(self.lb, self.ub, size=(self.n_init, self.dim))
+        # Current trust region length
+        self.length = self.length_init
+
+        # Verbosity
+        self.verbose = verbose
+
+    def initialize(self, restart=True):
+        if restart:
+            # Restart: Sample new initial points randomly across the entire search space using Latin Hypercube
+            X_init = latin_hypercube(self.n_init, self.dim)
+            X_init = from_unit_cube(X_init, self.lb, self.ub)
+        else:
+            # Initial initialization: Random uniform sampling
+            X_init = np.random.uniform(self.lb, self.ub, size=(self.n_init, self.dim))
+
         f_init = []
         for x in X_init:
             f_init.append(self.f(x))
-        f_init = np.array(f_init).reshape(-1,1)
+        f_init = np.array(f_init).reshape(-1, 1)
 
         self.X = np.vstack([self.X, X_init])
         self.fX = np.vstack([self.fX, f_init])
         self.n_evals += self.n_init
 
-        ibest = np.argmin(self.fX)
-        self.best_f = float(self.fX[ibest, 0])
-        self.best_x = self.X[ibest].copy()
+        idx_best = np.argmin(self.fX)
+        if self.fX[idx_best, 0] < self.best_f:
+            self.best_f = float(self.fX[idx_best, 0])
+            self.best_x = self.X[idx_best].copy()
 
-    def _update_trust_region(self, fX_next):
-        if np.min(fX_next) < self.best_f - 1e-3 * abs(self.best_f):
+        if self.verbose:
+            print(f"{'Restarting' if restart else 'Initializing'} with {self.n_init} points. Best f: {self.best_f:.4f}")
+
+    def _update_trust_region(self, fX_batch):
+        if np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f):
             self.success_count += 1
             self.fail_count = 0
+            if self.verbose:
+                print(f"Success count increased to {self.success_count}")
         else:
             self.fail_count += 1
             self.success_count = 0
+            if self.verbose:
+                print(f"Fail count increased to {self.fail_count}")
 
         if self.success_count >= self.success_tol:
+            old_length = self.length
             self.length = min(self.length * 2.0, self.length_max)
             self.success_count = 0
+            if self.verbose:
+                print(f"Expanding trust region from {old_length:.4f} to {self.length:.4f}")
         if self.fail_count >= self.fail_tol:
+            old_length = self.length
             self.length = max(self.length / 2.0, self.length_min)
             self.fail_count = 0
+            if self.verbose:
+                print(f"Shrinking trust region from {old_length:.4f} to {self.length:.4f}")
+
+    def _create_candidates(self, X_scaled, f_scaled):
+        # Select the best point
+        i_best = np.argmin(f_scaled)
+        x_center = X_scaled[i_best:i_best+1, :]
+
+        # Define trust region boundaries
+        lb_tr = np.clip(x_center - self.length / 2.0, 0.0, 1.0)
+        ub_tr = np.clip(x_center + self.length / 2.0, 0.0, 1.0)
+
+        # Select points within the trust region
+        inside_mask = np.all((X_scaled >= lb_tr) & (X_scaled <= ub_tr), axis=1)
+        X_local = X_scaled[inside_mask]
+        f_local = f_scaled[inside_mask]
+
+        # If too few points in TR, use all points
+        if X_local.shape[0] < 2 * self.dim:
+            X_local = X_scaled
+            f_local = f_scaled
+
+        # Train GP on local points
+        gp_model, gp_likelihood = train_gp(
+            X_local,
+            f_local.ravel(),
+            n_training_steps=50,  # You can make this a hyperparameter if desired
+            use_ard=True  # Assuming ARD is desired
+        )
+
+        # Generate candidate points using Sobol sequence
+        seed = np.random.randint(int(1e6))
+        sobol = SobolEngine(self.dim, scramble=True, seed=seed)
+        pert = sobol.draw(self.n_cand).numpy()
+        X_cand = lb_tr + (ub_tr - lb_tr) * pert
+
+        # Apply probability-based perturbation
+        prob_perturb = min(20.0 / self.dim, 1.0)
+        mask = np.random.rand(self.n_cand, self.dim) <= prob_perturb
+        row_sum = np.sum(mask, axis=1)
+        for i in range(len(row_sum)):
+            if row_sum[i] == 0:
+                j = np.random.randint(0, self.dim)
+                mask[i, j] = True
+
+        X_cand_masked = np.ones_like(X_cand) * x_center
+        X_cand_masked[mask] = X_cand[mask]
+        X_cand = X_cand_masked
+
+        # Evaluate GP predictions
+        gp_model.eval()
+        gp_likelihood.eval()
+        with torch.no_grad():
+            X_torch = torch.tensor(X_cand, dtype=torch.float32)
+            dist = gp_likelihood(gp_model(X_torch))
+            f_samps = dist.sample(torch.Size([1])).numpy().reshape(-1)
+
+        # Select the best candidates based on sampled values
+        idx_sorted = np.argsort(-f_samps)
+        best_inds = idx_sorted[: self.batch_size]
+        return X_cand[best_inds]
+
+    def _restart_condition(self):
+        """Check if a restart is needed based on the current trust region size."""
+        return self.length <= self.length_min and self.n_evals < self.max_evals
 
     def optimize(self):
-        self._initialize()
-        while self.n_evals < self.max_evals and self.length > self.length_min:
-            lower_loc = np.maximum(self.lb, self.best_x - self.length/2)
-            upper_loc = np.minimum(self.ub, self.best_x + self.length/2)
+        # Initial optimization
+        self.length = self.length_init
+        self.initialize(restart=False)
 
-            X_next = np.random.uniform(lower_loc, upper_loc, size=(self.batch_size, self.dim))
-            fX_next = []
-            for xnew in X_next:
-                fX_next.append(self.f(xnew))
-            fX_next = np.array(fX_next).reshape(-1,1)
+        while self.n_evals < self.max_evals:
+            while self.n_evals < self.max_evals and self.length > self.length_min:
+                # Scale X to unit cube
+                X_scaled = to_unit_cube(self.X, self.lb, self.ub)
+                f_scaled = self.fX.ravel()
 
-            self.X = np.vstack([self.X, X_next])
-            self.fX = np.vstack([self.fX, fX_next])
-            self.n_evals += self.batch_size
+                # Generate next candidates
+                X_next_scaled = self._create_candidates(X_scaled, f_scaled)
+                X_next = from_unit_cube(X_next_scaled, self.lb, self.ub)
 
-            mval = np.min(fX_next)
-            if mval < self.best_f:
-                self.best_f = float(mval)
-                self.best_x = X_next[np.argmin(fX_next)].copy()
+                # Evaluate new points
+                fX_next = []
+                for xnew in X_next:
+                    fX_next.append(self.f(xnew))
+                fX_next = np.array(fX_next).reshape(-1, 1)
 
-            self._update_trust_region(fX_next)
+                # Update data
+                self.X = np.vstack([self.X, X_next])
+                self.fX = np.vstack([self.fX, fX_next])
+                self.n_evals += self.batch_size
+
+                # Update best found point
+                min_batch = np.min(fX_next)
+                if min_batch < self.best_f:
+                    self.best_f = float(min_batch)
+                    self.best_x = X_next[np.argmin(fX_next)].copy()
+                    if self.verbose:
+                        print(f"New best f: {self.best_f:.4f}")
+
+                # Update trust region
+                self._update_trust_region(fX_next)
+
+            # Check if restart is needed
+            if self._restart_condition():
+                if self.verbose:
+                    print(f"Restarting TuRBO: {self.n_evals}/{self.max_evals} evaluations used.")
+                # Restart by sampling new points across the entire search space
+                self.initialize(restart=True)
+                # Reset trust region length
+                self.length = self.length_init
+            else:
+                break  # No more evaluations or cannot restart
 
         return self.best_x, self.best_f
+
 
 
 # =============== Standalone PCA-BO (simple) ===============
@@ -431,7 +614,7 @@ class SimplePCABO:
             )
 
             # Generate candidate points in the reduced space
-            n_candidates = min(50 * d_eff, 2500)
+            n_candidates = min(100 * d_eff, 2500)
             sobol = SobolEngine(d_eff, scramble=True, seed=np.random.randint(1e6))
             Z = sobol.draw(n_candidates).numpy() * 2.0 - 1.0
 
@@ -443,15 +626,14 @@ class SimplePCABO:
                 dist = gp_likelihood(gp_model(Z_torch))
                 f_samps = dist.sample(torch.Size([1])).numpy().reshape(-1)
 
-            # A simple “EI‐like” approach is to pick those with the smallest predicted f-value 
-            # or highest negative f_samps:
+            # Select the best candidates based on sampled values
             idx_top = np.argsort(f_samps)[: self.batch_size]
 
             Z_next = Z[idx_top]
 
-            # Map back from PCA space to original dimension
-            # In your code you use `_apply_pca_unweighted(...)`. For example:
-            X_scaled_next = _apply_pca_unweighted(Z_next, pca, X_mean)
+            # **Correctly inverse transform PCA**
+            X_scaled_next = pca.inverse_transform(Z_next) + X_mean
+
             # Then unscale back to [lb, ub]
             X_next = X_scaled_next * (self.ub - self.lb) + self.lb
 
@@ -472,6 +654,7 @@ class SimplePCABO:
             if self.n_evals >= self.max_evals:
                 break
         return self.best_x, self.best_f
+
 
 
 
@@ -636,7 +819,7 @@ class BAXUS:
         lb_loc = np.clip(z_best - self.length / 2.0, -1.0, 1.0)
         ub_loc = np.clip(z_best + self.length / 2.0, -1.0, 1.0)
 
-        n_cand = min(50 * self.target_dim, 2500)
+        n_cand = min(100 * self.target_dim, 2500)
         sobol = SobolEngine(self.target_dim, scramble=True, seed=self.rng.randint(1e7))
         pert = sobol.draw(n_cand).numpy()
         Z_cand = lb_loc + (ub_loc - lb_loc) * pert
@@ -801,9 +984,9 @@ def run_one_experiment(method_name, fid, instance, dimension, n_reps=5, budget_m
 
 def main():
     # Example BBOB test set
-    fids = [1, 8, 12, 15, 21]
+    fids = [15]
     instances = [0, 1, 2]
-    dimensions = [2, 10, 40, 100]
+    dimensions = [40]
     methods = ["turbo_pca", "turbo_only", "pca_only", "baxus"]
     n_reps = 5
     budget_multiplier = 10
