@@ -35,25 +35,23 @@ from gpytorch.models import ExactGP
 SHARED_PARAMS = {
     # Generic BO hyperparams
     "n_init": 10,          # Number of initial points
-    "batch_size": 5,
+    "batch_size": 64,
     "use_ard": True,
     "pca_components": 2,  # For PCA-based methods
     # TuRBO trust-region settings
     "length_init": 0.8,
     "length_min": 0.5 ** 7,
-    "length_max": 3.2,     # Increased from 1.6
+    "length_max": 1.6,     
     "success_tol": 4,
     # GP training
     "n_training_steps": 50,
-    "lr": 0.005, 
-    # Candidate set
-    # Logic: n_cand = min(100*d, 2500) kept inside each class
+    "lr": 0.01, 
+    "max_evals_multiplier": 10,  # Used to calculate max_evals
     # BAXUS-specific
-    "baxus_train_interval": 1,  # Only train GP every 5 steps
     "baxus_fail_tol_factor": 4.0,
     "baxus_init_target_dim": 5,
     "baxus_seed": 0,
-    "max_evals_multiplier": 5,  # Used to calculate max_evals
+
 }
 
 # ======================== Correct GP Implementation ========================
@@ -1026,7 +1024,7 @@ class AxUSProjector:
 class BAXUS:
     """
     BAxUS-like optimizer: random embedding -> trust region in latent space -> dimension-splitting.
-    Retrains GP only every TRAIN_INTERVAL steps.
+    Retrains GP every iteration.
     """
     def __init__(self, f, lb, ub, hyperparams, verbose=False):
         """
@@ -1054,7 +1052,7 @@ class BAXUS:
         self.success_tol = hyperparams["success_tol"]
         self.fail_tol_factor = hyperparams["baxus_fail_tol_factor"]
 
-        self.length_init = hyperparams["length_init"]  # **Added this line**
+        self.length_init = hyperparams["length_init"]
         self.length = self.length_init
         self.length_min = hyperparams["length_min"]
         self.length_max = hyperparams["length_max"]
@@ -1080,7 +1078,6 @@ class BAXUS:
         self.gp_model = None
         self.gp_likelihood = None
 
-        self.TRAIN_INTERVAL = hyperparams["baxus_train_interval"]
         self.GP_TRAIN_STEPS = hyperparams["n_training_steps"]
 
         self.verbose = verbose  # Ensure verbose flag is set
@@ -1117,6 +1114,9 @@ class BAXUS:
             self.best_f = float(self.fX[idx_best, 0])
             self.best_x = self.X[idx_best].copy()
 
+        if self.verbose:
+            print(f"Initialized with {self.n_init} points. Best f: {self.best_f:.4f}")
+
     def _update_trust_region(self, fX_batch):
         """
         Update the trust region based on the latest batch of function evaluations.
@@ -1124,23 +1124,30 @@ class BAXUS:
         Parameters:
         - fX_batch (np.ndarray): Latest function evaluations of shape (batch_size, 1)
         """
-        if np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f):
+        improvement = np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f)
+        if improvement:
             self.success_count += 1
             self.fail_count = 0
+            if self.verbose:
+                print(f"Success count increased to {self.success_count}")
         else:
             self.fail_count += 1
             self.success_count = 0
+            if self.verbose:
+                print(f"Fail count increased to {self.fail_count}")
 
         if self.success_count >= self.success_tol:
+            old_length = self.length
             self.length = min(self.length * 2.0, self.length_max)
-            if self.verbose:
-                print(f"Increase trust region length to {self.length}")
             self.success_count = 0
-        if self.fail_count >= self._fail_tol():
-            self.length = max(self.length / 2.0, self.length_min)
             if self.verbose:
-                print(f"Decrease trust region length to {self.length}")
+                print(f"Expanding trust region from {old_length:.4f} to {self.length:.4f}")
+        if self.fail_count >= self._fail_tol():
+            old_length = self.length
+            self.length = max(self.length / 2.0, self.length_min)
             self.fail_count = 0
+            if self.verbose:
+                print(f"Shrinking trust region from {old_length:.4f} to {self.length:.4f}")
 
     def _choose_splitting_dims(self):
         """
@@ -1169,19 +1176,33 @@ class BAXUS:
         old_td = self.target_dim
         self.target_dim = self.projector.target_dim
 
-        # Reset the trust region and data
-        self.Z = np.zeros((0, self.target_dim))
-        self.X = np.zeros((0, self.dim))
-        self.fX = np.zeros((0, 1))
-        self.n_evals = 0
-        self.best_f = float('inf')
-        self.best_x = None
+        # Augment Z with new dimensions without resetting n_evals
+        n_existing = self.Z.shape[0]
+        n_new = self.target_dim - old_td
+        if n_new > 0 and n_existing > 0:
+            new_Z = self.rng.uniform(-1.0, 1.0, size=(n_existing, n_new))
+            self.Z = np.hstack([self.Z, new_Z])
+        elif n_new > 0 and n_existing == 0:
+            # If no existing points, initialize Z
+            Z_init = self.rng.uniform(-1.0, 1.0, size=(self.n_init, self.target_dim))
+            self.Z = np.vstack([self.Z, Z_init])
+            X_up = self.projector.project_up(Z_init)
+            X_mapped = 0.5 * (X_up + 1.0)  # Scale from [-1, 1] to [0, 1]
+            X_mapped = X_mapped * (self.ub - self.lb) + self.lb  # Scale to [lb, ub]
+            fvals = np.array([self.f(x_) for x_ in X_mapped]).reshape(-1, 1)
+            self.X = np.vstack([self.X, X_mapped])
+            self.fX = np.vstack([self.fX, fvals])
+            self.n_evals += self.n_init
+            idx_best = np.argmin(self.fX)
+            if self.fX[idx_best, 0] < self.best_f:
+                self.best_f = float(self.fX[idx_best, 0])
+                self.best_x = self.X[idx_best].copy()
+
+        # Reset trust region length
         self.length = self.length_init
 
         if self.verbose:
             print(f"Split dimensions. New target dimensionality: {self.target_dim}")
-
-        self._initialize()
 
     def _create_candidates_and_select(self):
         """
@@ -1190,7 +1211,6 @@ class BAXUS:
         Returns:
         - Z_selected (np.ndarray): Selected latent points of shape (batch_size, target_dim)
         """
-
         i_best = np.argmin(self.fX)
         z_best = self.Z[i_best:i_best+1, :]
 
@@ -1231,7 +1251,7 @@ class BAXUS:
     def optimize(self):
         """
         Run the optimization process until the evaluation budget is exhausted.
-        
+
         Returns:
         - best_x (np.ndarray): Best found input
         - best_f (float): Best found function value
@@ -1239,39 +1259,38 @@ class BAXUS:
         self._initialize()
 
         while self.n_evals < self.max_evals:
-            # Retrain GP every TRAIN_INTERVAL steps or if GP not trained yet
-            if (self.n_evals == self.n_init) or (self.n_evals % self.TRAIN_INTERVAL == 0) or (self.gp_model is None):
-                train_x = torch.tensor(self.Z, dtype=torch.float32)
-                train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
-                self.gp_model, self.gp_likelihood = train_gp(
-                    train_x=train_x,
-                    train_y=train_y,
-                    use_ard=self.use_ard,
-                    num_steps=self.GP_TRAIN_STEPS,
-                    device=train_x.device,
-                    dtype=train_x.dtype
-                )
-                if self.verbose:
-                    print(f"GP retrained at evaluation {self.n_evals}")
+            # Retrain GP every iteration
+            train_x = torch.tensor(self.Z, dtype=torch.float32)
+            train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
+            self.gp_model, self.gp_likelihood = train_gp(
+                train_x=train_x,
+                train_y=train_y,
+                use_ard=self.use_ard,
+                num_steps=self.GP_TRAIN_STEPS,
+                device=train_x.device,
+                dtype=train_x.dtype
+            )
+            if self.verbose:
+                print(f"GP retrained at evaluation {self.n_evals}")
 
-                # Possibly split dimension
-                if self.target_dim < self.dim and self.success_count == 0 and self.fail_count == 0:
-                    dims_and_bins = self._choose_splitting_dims()
-                    if dims_and_bins:
-                        self._split_dimensions(dims_and_bins)
-                        # Re-train after splitting
-                        train_x = torch.tensor(self.Z, dtype=torch.float32)
-                        train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
-                        self.gp_model, self.gp_likelihood = train_gp(
-                            train_x=train_x,
-                            train_y=train_y,
-                            use_ard=self.use_ard,
-                            num_steps=self.GP_TRAIN_STEPS,
-                            device=train_x.device,
-                            dtype=train_x.dtype
-                        )
-                        if self.verbose:
-                            print(f"GP retrained after dimension splitting at evaluation {self.n_evals}")
+            # Possibly split dimension
+            if self.target_dim < self.dim and self.success_count == 0 and self.fail_count == 0:
+                dims_and_bins = self._choose_splitting_dims()
+                if dims_and_bins:
+                    self._split_dimensions(dims_and_bins)
+                    # Retrain GP after splitting
+                    train_x = torch.tensor(self.Z, dtype=torch.float32)
+                    train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
+                    self.gp_model, self.gp_likelihood = train_gp(
+                        train_x=train_x,
+                        train_y=train_y,
+                        use_ard=self.use_ard,
+                        num_steps=self.GP_TRAIN_STEPS,
+                        device=train_x.device,
+                        dtype=train_x.dtype
+                    )
+                    if self.verbose:
+                        print(f"GP retrained after dimension splitting at evaluation {self.n_evals}")
 
             # Generate and select candidates
             Z_next = self._create_candidates_and_select()
@@ -1311,6 +1330,7 @@ class BAXUS:
             print(f"Optimization completed. Best f: {self.best_f} at evaluation {self.n_evals}")
 
         return self.best_x, self.best_f
+
 
 # ============ Benchmark Loop ============
 
@@ -1410,9 +1430,9 @@ def main():
     # Example BBOB test set
     fids = [1,8,12,15,21]  # List of function IDs
     instances = [0, 1, 2]  # List of instances
-    dimensions = [40]  # List of dimensions
-    methods = ["baxus"]
-    n_reps = 1
+    dimensions = [2,10,40,100]  # List of dimensions
+    methods = ["baxus", "turbo_pca", "turbo_only", "pca_only"]  # List of methods
+    n_reps = 5
     budget_multiplier = SHARED_PARAMS["max_evals_multiplier"]
 
     total_runs = len(fids) * len(instances) * len(dimensions) * len(methods)
@@ -1437,7 +1457,7 @@ def main():
                         dimension=dim,
                         n_reps=n_reps,
                         budget_multiplier=budget_multiplier,
-                        verbose=True
+                        verbose=False
                     )
                     runtime_results[(m, fid, inst, dim)] = avg_time
 
