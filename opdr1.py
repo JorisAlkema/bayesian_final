@@ -17,7 +17,6 @@ import time
 import math
 import numpy as np
 import torch
-import gpytorch
 from torch.quasirandom import SobolEngine
 from sklearn.decomposition import PCA
 from scipy.stats import rankdata, qmc
@@ -36,25 +35,24 @@ from gpytorch.models import ExactGP
 SHARED_PARAMS = {
     # Generic BO hyperparams
     "n_init": 10,          # Number of initial points
-    "batch_size": 8,
+    "batch_size": 32,
     "use_ard": True,
-    "pca_components": 4,  # For PCA-based methods
+    "pca_components": 2,  # For PCA-based methods
     # TuRBO trust-region settings
     "length_init": 0.8,
     "length_min": 0.5 ** 7,
-    "length_max": 4.0,     # Increased from 1.6
+    "length_max": 1.6,     
     "success_tol": 4,
     # GP training
     "n_training_steps": 50,
-    "lr": 0.005,
-    # Candidate set
-    # Logic: n_cand = min(100*d, 2500) kept inside each class
+    "lr": 0.01, 
+    "max_evals_multiplier": 10,  # Used to calculate max_evals
+    "sobol_seed": 0,
     # BAXUS-specific
-    "baxus_train_interval": 5,  # Only train GP every 5 steps
     "baxus_fail_tol_factor": 4.0,
     "baxus_init_target_dim": 5,
     "baxus_seed": 0,
-    "max_evals_multiplier": 10,  # Used to calculate max_evals
+
 }
 
 # ======================== Correct GP Implementation ========================
@@ -94,9 +92,6 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}, device=None, dtype
     - model (GP): Trained GP model
     - likelihood (GaussianLikelihood): Trained likelihood
     """
-    assert train_x.ndim == 2, "train_x must be a 2D tensor."
-    assert train_y.ndim == 1, "train_y must be a 1D tensor."
-    assert train_x.shape[0] == train_y.shape[0], "train_x and train_y must have the same number of samples."
 
     # Create hyperparameter bounds
     noise_constraint = Interval(5e-4, 0.2)
@@ -214,22 +209,25 @@ def _weighted_pca(X_scaled, f_scaled, n_components):
 
     return pca, X_reduced, X_mean
 
-
-def _apply_pca_unweighted(X_scaled, pca, X_mean):
+def _apply_pca_unweighted(X_reduced, pca, X_mean):
     """
-    Apply PCA transformation without weighting.
+    Apply inverse PCA transformation to map reduced data back to the original space.
 
     Parameters:
-    - X_scaled (np.ndarray): Scaled input data of shape (n_samples, n_features)
+    - X_reduced (np.ndarray): PCA-reduced data of shape (n_samples, n_components)
     - pca (PCA): Fitted PCA object
-    - X_mean (np.ndarray): Mean of the original data
+    - X_mean (np.ndarray): Mean of the original scaled data of shape (n_features,)
 
     Returns:
-    - X_reduced (np.ndarray): PCA-transformed data
+    - X_original (np.ndarray): Data transformed back to the original space of shape (n_samples, n_features)
     """
-    X_centered = X_scaled - X_mean
-    X_reduced = pca.transform(X_centered)
-    return X_reduced
+    # Inverse transform to original space
+    X_original = pca.inverse_transform(X_reduced)
+    
+    # Add the mean back to the original space
+    X_original += X_mean
+    
+    return X_original
 
 
 def latin_hypercube(n_samples, dim):
@@ -249,11 +247,14 @@ def latin_hypercube(n_samples, dim):
 
 # ================== TuRBO_PCA_BO Class with Proper Restart Mechanism ==================
 
+
+
 class TuRBO_PCA_BO:
     """
     TuRBO combined with Weighted-PCA approach for Bayesian Optimization.
     Utilizes a local trust region and PCA for dimensionality reduction.
     """
+
     def __init__(self, f, lb, ub, hyperparams, verbose=False):
         """
         Initialize the TuRBO_PCA_BO optimizer.
@@ -270,23 +271,32 @@ class TuRBO_PCA_BO:
         self.ub = ub
         self.dim = len(lb)
 
-        # Unpack shared hyperparams
-        self.n_init = hyperparams["n_init"]
-        self.max_evals = hyperparams["max_evals_multiplier"] * self.dim
-        self.batch_size = hyperparams["batch_size"]
-        self.use_ard = hyperparams["use_ard"]
-        self.pca_components = hyperparams["pca_components"]
-        self.length_init = hyperparams["length_init"]
-        self.length_min = hyperparams["length_min"]
-        self.length_max = hyperparams["length_max"]
-        self.success_tol = hyperparams["success_tol"]
-        self.fail_tol = np.ceil(max(4.0 / self.batch_size, self.dim / self.batch_size))
-        self.lr = hyperparams["lr"]
-        self.n_training_steps = hyperparams["n_training_steps"]
+        # Unpack shared hyperparams with default values
+        self.n_init = hyperparams.get("n_init", 2 * self.dim)
+        self.max_evals = hyperparams.get("max_evals_multiplier", 10) * self.dim
+        self.batch_size = hyperparams.get("batch_size", 1)
+        self.use_ard = hyperparams.get("use_ard", True)
+        self.pca_components = hyperparams.get("pca_components", min(5, self.dim))
+        self.length_init = hyperparams.get("length_init", 0.8)
+        self.length_min = hyperparams.get("length_min", 0.5 ** 7)
+        self.length_max = hyperparams.get("length_max", 1.6)
+        self.success_tol = hyperparams.get("success_tol", 3)
+        self.fail_tol = math.ceil(max(4.0 / self.batch_size, self.dim / self.batch_size))
+        self.lr = hyperparams.get("lr", 0.01)
+        self.n_training_steps = hyperparams.get("n_training_steps", 50)
+        self.verbose = verbose
+        self.seed = hyperparams.get("sobol_seed", 0)
+
+        # Device and dtype for GPyTorch
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.float32  # Consistently use float32
+
+        if self.verbose:
+            print(f"Using device: {self.device}, dtype: {self.dtype}")
 
         # Data storage
-        self.X = np.zeros((0, self.dim))
-        self.fX = np.zeros((0, 1))
+        self.X = np.empty((0, self.dim))
+        self.fX = np.empty((0, 1))
         self.best_x = None
         self.best_f = float('inf')
         self.n_evals = 0
@@ -303,6 +313,9 @@ class TuRBO_PCA_BO:
         # Verbosity
         self.verbose = verbose
 
+        # Hyperparameters storage
+        self.hypers = {}
+
     def initialize(self, restart=True):
         """
         Initialize or restart the optimizer by sampling new points.
@@ -314,17 +327,21 @@ class TuRBO_PCA_BO:
             # Restart: Sample new initial points using Latin Hypercube
             X_init = latin_hypercube(self.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
-        else:
-            # Initial initialization: Random uniform sampling
-            X_init = np.random.uniform(self.lb, self.ub, size=(self.n_init, self.dim))
+            f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
 
-        f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
-
-        if restart:
             # Replace existing data
             self.X = X_init
             self.fX = f_init
+
+            # Reset counters
+            self.success_count = 0
+            self.fail_count = 0
         else:
+            # Initial initialization: Latin Hypercube Sampling
+            X_init = latin_hypercube(self.n_init, self.dim)
+            X_init = from_unit_cube(X_init, self.lb, self.ub)
+            f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
+
             # Append during initial initialization
             self.X = np.vstack([self.X, X_init])
             self.fX = np.vstack([self.fX, f_init])
@@ -346,7 +363,8 @@ class TuRBO_PCA_BO:
         Parameters:
         - fX_batch (np.ndarray): Latest function evaluations of shape (batch_size, 1)
         """
-        if np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f):
+        improvement = np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f)
+        if improvement:
             self.success_count += 1
             self.fail_count = 0
             if self.verbose:
@@ -379,67 +397,84 @@ class TuRBO_PCA_BO:
         - f_scaled (np.ndarray): Scaled function values of shape (n_samples,)
 
         Returns:
-        - X_cand_selected (np.ndarray): Selected candidate points of shape (batch_size, n_features)
+        - X_cand_selected_original (np.ndarray): Selected candidate points in original space of shape (batch_size, n_features)
         """
-        i_best = np.argmin(f_scaled)
-        x_center = X_scaled[i_best:i_best+1, :]
+        # Standardize function values
+        mu, sigma = np.median(f_scaled), f_scaled.std()
+        sigma = 1.0 if sigma < 1e-6 else sigma
+        f_standardized = (f_scaled - mu) / sigma
 
-        lb_tr = np.clip(x_center - self.length / 2.0, 0.0, 1.0)
-        ub_tr = np.clip(x_center + self.length / 2.0, 0.0, 1.0)
+        if self.verbose:
+            print("Performing Weighted PCA on local points...")
+        
+        # Perform Weighted PCA
+        pca, X_reduced_local, X_mean = _weighted_pca(X_scaled, f_standardized, self.pca_components)
 
-        inside_mask = np.all((X_scaled >= lb_tr) & (X_scaled <= ub_tr), axis=1)
-        X_local = X_scaled[inside_mask]
-        f_local = f_scaled[inside_mask]
+        if self.verbose:
+            print(f"PCA completed. Reduced to {self.pca_components} components.")
 
-        # If too few points in trust region, use all points
-        if X_local.shape[0] < 2 * self.pca_components:
-            X_local = X_scaled
-            f_local = f_scaled
-
-        pca, X_reduced_local, X_mean = _weighted_pca(X_local, f_local, self.pca_components)
-
-        # Train GP in reduced dimension
-        train_x = torch.tensor(X_reduced_local, dtype=torch.float32)
-        train_y = torch.tensor(f_local.ravel(), dtype=torch.float32)
+        # Train GP on reduced and standardized data
+        train_x = torch.tensor(X_reduced_local, dtype=self.dtype).to(self.device)
+        train_y = torch.tensor(f_standardized, dtype=self.dtype).to(self.device)
+        if self.verbose:
+            print("Training GP on reduced and standardized data...")
         gp_model, gp_likelihood = train_gp(
             train_x=train_x,
             train_y=train_y,
             use_ard=self.use_ard,
             num_steps=self.n_training_steps,
-            device=train_x.device,
-            dtype=train_x.dtype
+            hypers=self.hypers,
+            device=self.device,
+            dtype=self.dtype
         )
+        if self.verbose:
+            print("GP training completed.")
 
-        # Generate candidate points using Sobol sequence
-        sobol = SobolEngine(self.dim, scramble=True)
+        # Update hyperparameters
+        self.hypers = gp_model.state_dict()
+
+        # Generate candidate points using Sobol sequence in reduced space
+        sobol = SobolEngine(self.pca_components, scramble=True, seed=self.seed)
         pert = sobol.draw(self.n_cand).numpy()
-        X_cand = lb_tr + (ub_tr - lb_tr) * pert
+        X_cand_reduced = pert  # Candidates in reduced PCA space
 
         # Apply probability-based perturbation
-        prob_perturb = min(20.0 / self.dim, 1.0)
-        mask = np.random.rand(self.n_cand, self.dim) <= prob_perturb
+        prob_perturb = min(20.0 / self.pca_components, 1.0)
+        mask = np.random.rand(self.n_cand, self.pca_components) <= prob_perturb
         row_sum = np.sum(mask, axis=1)
         for i in range(len(row_sum)):
             if row_sum[i] == 0:
-                j = np.random.randint(0, self.dim)
+                j = np.random.randint(0, self.pca_components)
                 mask[i, j] = True
 
-        X_cand_masked = np.ones_like(X_cand) * x_center
-        X_cand_masked[mask] = X_cand[mask]
-        X_cand = X_cand_masked
+        X_cand_masked = np.ones_like(X_cand_reduced) * X_reduced_local[np.argmin(f_standardized), :]
+        X_cand_masked[mask] = X_cand_reduced[mask]
+        X_cand_reduced = X_cand_masked
 
-        X_reduced_cand = _apply_pca_unweighted(X_cand, pca, X_mean)
+        if self.verbose:
+            print("Evaluating GP predictions on candidate points...")
 
+        # Evaluate GP predictions on candidates
         gp_model.eval()
         gp_likelihood.eval()
         with torch.no_grad():
-            X_torch = torch.tensor(X_reduced_cand, dtype=torch.float32)
+            X_torch = torch.tensor(X_cand_reduced, dtype=self.dtype).to(self.device)
             dist = gp_likelihood(gp_model(X_torch))
-            f_samps = dist.sample(torch.Size([1])).numpy().reshape(-1)
+            f_samps_standardized = dist.sample(torch.Size([1])).cpu().numpy().reshape(-1)
+            f_samps = mu + sigma * f_samps_standardized  # Transform back to original scale
 
+        # Select the best candidates based on sampled function values
         idx_sorted = np.argsort(f_samps)
         best_inds = idx_sorted[:self.batch_size]
-        return X_cand[best_inds]
+        X_cand_selected_reduced = X_cand_reduced[best_inds]
+
+        # Inverse PCA to original space
+        X_cand_selected_original = _apply_pca_unweighted(X_cand_selected_reduced, pca, X_mean)
+
+        if self.verbose:
+            print(f"Selected {self.batch_size} candidate points.")
+
+        return X_cand_selected_original
 
     def _restart_condition(self):
         """
@@ -469,14 +504,16 @@ class TuRBO_PCA_BO:
                 f_scaled = self.fX.ravel()
 
                 # Generate next candidates
-                X_next_scaled = self._create_candidates(X_scaled, f_scaled)
-                X_next = from_unit_cube(X_next_scaled, self.lb, self.ub)
+                X_next = self._create_candidates(X_scaled, f_scaled)
+
+                # Scale candidates back to original space
+                X_next_original = from_unit_cube(X_next, self.lb, self.ub)
 
                 # Evaluate new points
-                fX_next = np.array([self.f(xnew) for xnew in X_next]).reshape(-1, 1)
+                fX_next = np.array([self.f(xnew) for xnew in X_next_original]).reshape(-1, 1)
 
                 # Update data
-                self.X = np.vstack([self.X, X_next])
+                self.X = np.vstack([self.X, X_next_original])
                 self.fX = np.vstack([self.fX, fX_next])
                 self.n_evals += self.batch_size
 
@@ -484,7 +521,7 @@ class TuRBO_PCA_BO:
                 min_batch = np.min(fX_next)
                 if min_batch < self.best_f:
                     self.best_f = float(min_batch)
-                    self.best_x = X_next[np.argmin(fX_next)].copy()
+                    self.best_x = X_next_original[np.argmin(fX_next)].copy()
                     if self.verbose:
                         print(f"New best f: {self.best_f:.4f}")
 
@@ -494,7 +531,7 @@ class TuRBO_PCA_BO:
             # Check if restart is needed
             if self._restart_condition():
                 if self.verbose:
-                    print(f"Restarting TuRBO: {self.n_evals}/{self.max_evals} evaluations used.")
+                    print(f"Restarting TuRBO_PCA_BO: {self.n_evals}/{self.max_evals} evaluations used.")
                 # Restart by sampling new points across the entire search space
                 self.initialize(restart=True)
                 # Reset trust region length
@@ -504,23 +541,22 @@ class TuRBO_PCA_BO:
 
         return self.best_x, self.best_f
 
-# ================== Standalone TuRBO (TurboOnly) with Proper Restart Mechanism ==================
-
 class TurboOnly:
     """
     Standalone TuRBO (Trust Region Bayesian Optimization) implementation.
     Utilizes a local trust region without PCA-based dimensionality reduction.
     """
+
     def __init__(self, f, lb, ub, hyperparams, verbose=False):
         """
         Initialize the TurboOnly optimizer.
 
         Parameters:
-        - f (callable): Objective function to minimize
-        - lb (np.ndarray): Lower bounds of the search space
-        - ub (np.ndarray): Upper bounds of the search space
-        - hyperparams (dict): Hyperparameters from SHARED_PARAMS
-        - verbose (bool): If True, prints progress messages
+        - f (callable): Objective function to minimize.
+        - lb (np.ndarray): Lower bounds of the search space.
+        - ub (np.ndarray): Upper bounds of the search space.
+        - hyperparams (dict): Hyperparameters from SHARED_PARAMS.
+        - verbose (bool): If True, prints progress messages.
         """
         self.f = f
         self.lb = lb
@@ -528,20 +564,22 @@ class TurboOnly:
         self.dim = len(lb)
 
         # Unpack shared hyperparams
-        self.n_init = hyperparams["n_init"]
-        self.max_evals = hyperparams["max_evals_multiplier"] * self.dim
-        self.batch_size = hyperparams["batch_size"]
-        self.length_init = hyperparams["length_init"]
-        self.length_min = hyperparams["length_min"]
-        self.length_max = hyperparams["length_max"]
-        self.success_tol = hyperparams["success_tol"]
-        self.fail_tol = np.ceil(max(4.0 / self.batch_size, self.dim / self.batch_size))
-        self.lr = hyperparams["lr"]
-        self.n_training_steps = hyperparams["n_training_steps"]
+        self.n_init = hyperparams.get("n_init", 2 * self.dim)
+        self.max_evals = hyperparams.get("max_evals_multiplier", 10) * self.dim
+        self.batch_size = hyperparams.get("batch_size", 1)
+        self.length_init = hyperparams.get("length_init", 0.8)
+        self.length_min = hyperparams.get("length_min", 0.5 ** 7)
+        self.length_max = hyperparams.get("length_max", 1.6)
+        self.success_tol = hyperparams.get("success_tol", 3)
+        self.fail_tol = math.ceil(max(4.0 / self.batch_size, self.dim / self.batch_size))
+        self.lr = hyperparams.get("lr", 0.01)
+        self.n_training_steps = hyperparams.get("n_training_steps", 50)
+        self.use_ard = hyperparams.get("use_ard", True)
+        self.seed = hyperparams.get("sobol_seed", 0)
 
         # Data storage
-        self.X = np.zeros((0, self.dim))
-        self.fX = np.zeros((0, 1))
+        self.X = np.empty((0, self.dim))
+        self.fX = np.empty((0, 1))
         self.best_x = None
         self.best_f = float('inf')
         self.n_evals = 0
@@ -550,7 +588,7 @@ class TurboOnly:
         self.fail_count = 0
 
         # Candidate set size
-        self.n_cand = min(100 * self.dim, 2500)
+        self.n_cand = min(100 * self.dim, 5000)
 
         # Current trust region length
         self.length = self.length_init
@@ -563,23 +601,27 @@ class TurboOnly:
         Initialize or restart the optimizer by sampling new points.
 
         Parameters:
-        - restart (bool): If True, replaces existing data with new samples
+        - restart (bool): If True, replaces existing data with new samples.
         """
         if restart:
             # Restart: Sample new initial points using Latin Hypercube
             X_init = latin_hypercube(self.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
-        else:
-            # Initial initialization: Random uniform sampling
-            X_init = np.random.uniform(self.lb, self.ub, size=(self.n_init, self.dim))
+            f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
 
-        f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
-
-        if restart:
             # Replace existing data
             self.X = X_init
             self.fX = f_init
+
+            # Reset counters
+            self.success_count = 0
+            self.fail_count = 0
         else:
+            # Initial initialization: Latin Hypercube Sampling
+            X_init = latin_hypercube(self.n_init, self.dim)
+            X_init = from_unit_cube(X_init, self.lb, self.ub)
+            f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
+
             # Append during initial initialization
             self.X = np.vstack([self.X, X_init])
             self.fX = np.vstack([self.fX, f_init])
@@ -599,9 +641,10 @@ class TurboOnly:
         Update the trust region based on the latest batch of function evaluations.
 
         Parameters:
-        - fX_batch (np.ndarray): Latest function evaluations of shape (batch_size, 1)
+        - fX_batch (np.ndarray): Latest function evaluations of shape (batch_size, 1).
         """
-        if np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f):
+        improvement = np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f)
+        if improvement:
             self.success_count += 1
             self.fail_count = 0
             if self.verbose:
@@ -625,23 +668,45 @@ class TurboOnly:
             if self.verbose:
                 print(f"Shrinking trust region from {old_length:.4f} to {self.length:.4f}")
 
-    def _create_candidates(self, X_scaled, f_scaled):
+    def _create_candidates(self, X_scaled, f_scaled, hypers):
         """
         Generate candidate points within the trust region using the GP model.
 
         Parameters:
-        - X_scaled (np.ndarray): Scaled input data of shape (n_samples, n_features)
-        - f_scaled (np.ndarray): Scaled function values of shape (n_samples,)
+        - X_scaled (np.ndarray): Scaled input data of shape (n_samples, n_features).
+        - f_scaled (np.ndarray): Scaled function values of shape (n_samples,).
+        - hypers (dict): Current hyperparameters for the GP.
 
         Returns:
-        - X_cand_selected (np.ndarray): Selected candidate points of shape (batch_size, n_features)
+        - X_cand_selected (np.ndarray): Selected candidate points of shape (batch_size, n_features).
         """
+        # Standardize function values
+        mu, sigma = np.median(f_scaled), f_scaled.std()
+        sigma = 1.0 if sigma < 1e-6 else sigma
+        f_standardized = (f_scaled - mu) / sigma
+
+        # Train GP on standardized data
+        train_x = torch.tensor(X_scaled, dtype=torch.float32)
+        train_y = torch.tensor(f_standardized, dtype=torch.float32)
+        gp_model, gp_likelihood = train_gp(
+            train_x=train_x,
+            train_y=train_y,
+            use_ard=self.use_ard,
+            num_steps=self.n_training_steps,
+            hypers=hypers,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            dtype=torch.float32
+        )
+
+        # Find the best point
         i_best = np.argmin(f_scaled)
         x_center = X_scaled[i_best:i_best+1, :]
 
+        # Define trust region bounds
         lb_tr = np.clip(x_center - self.length / 2.0, 0.0, 1.0)
         ub_tr = np.clip(x_center + self.length / 2.0, 0.0, 1.0)
 
+        # Select points within the trust region
         inside_mask = np.all((X_scaled >= lb_tr) & (X_scaled <= ub_tr), axis=1)
         X_local = X_scaled[inside_mask]
         f_local = f_scaled[inside_mask]
@@ -651,16 +716,17 @@ class TurboOnly:
             X_local = X_scaled
             f_local = f_scaled
 
-        # Train GP on local points
+        # Retrain GP on potentially updated local points
         train_x = torch.tensor(X_local, dtype=torch.float32)
-        train_y = torch.tensor(f_local.ravel(), dtype=torch.float32)
+        train_y = torch.tensor((f_local - mu) / sigma, dtype=torch.float32)
         gp_model, gp_likelihood = train_gp(
             train_x=train_x,
             train_y=train_y,
             use_ard=self.use_ard,
             num_steps=self.n_training_steps,
-            device=train_x.device,
-            dtype=train_x.dtype
+            hypers=hypers,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            dtype=torch.float32
         )
 
         # Generate candidate points using Sobol sequence
@@ -681,37 +747,44 @@ class TurboOnly:
         X_cand_masked[mask] = X_cand[mask]
         X_cand = X_cand_masked
 
+        # Evaluate GP predictions on candidates
         gp_model.eval()
         gp_likelihood.eval()
         with torch.no_grad():
             X_torch = torch.tensor(X_cand, dtype=torch.float32)
             dist = gp_likelihood(gp_model(X_torch))
             f_samps = dist.sample(torch.Size([1])).numpy().reshape(-1)
+            f_samps = mu + sigma * f_samps  # Transform back to original scale
 
+        # Select the best candidates based on sampled function values
         idx_sorted = np.argsort(f_samps)
         best_inds = idx_sorted[:self.batch_size]
-        return X_cand[best_inds]
+        X_cand_selected = X_cand[best_inds]
+
+        return X_cand_selected
 
     def _restart_condition(self):
         """
         Determine if a restart is needed based on the current trust region size and evaluations.
 
         Returns:
-        - bool: True if a restart is needed, False otherwise
+        - bool: True if a restart is needed, False otherwise.
         """
         return self.length <= self.length_min and self.n_evals < self.max_evals
 
     def optimize(self):
         """
         Run the optimization process until the evaluation budget is exhausted.
-        
+
         Returns:
-        - best_x (np.ndarray): Best found input
-        - best_f (float): Best found function value
+        - best_x (np.ndarray): Best found input.
+        - best_f (float): Best found function value.
         """
         # Initial optimization
         self.length = self.length_init
         self.initialize(restart=False)
+
+        hypers = {}  # Initialize hyperparameters
 
         while self.n_evals < self.max_evals:
             while self.n_evals < self.max_evals and self.length > self.length_min:
@@ -720,8 +793,7 @@ class TurboOnly:
                 f_scaled = self.fX.ravel()
 
                 # Generate next candidates
-                X_next_scaled = self._create_candidates(X_scaled, f_scaled)
-                X_next = from_unit_cube(X_next_scaled, self.lb, self.ub)
+                X_next = self._create_candidates(X_scaled, f_scaled, hypers)
 
                 # Evaluate new points
                 fX_next = np.array([self.f(xnew) for xnew in X_next]).reshape(-1, 1)
@@ -892,6 +964,7 @@ class SimplePCABO:
 
 # ================== AxUS & BAXUS Implementations ==================
 
+
 class AxUSProjector:
     """
     Random embedding akin to AxUS (used by BAxUS).
@@ -954,7 +1027,7 @@ class AxUSProjector:
 class BAXUS:
     """
     BAxUS-like optimizer: random embedding -> trust region in latent space -> dimension-splitting.
-    Retrains GP only every TRAIN_INTERVAL steps.
+    Retrains GP every iteration.
     """
     def __init__(self, f, lb, ub, hyperparams, verbose=False):
         """
@@ -982,7 +1055,8 @@ class BAXUS:
         self.success_tol = hyperparams["success_tol"]
         self.fail_tol_factor = hyperparams["baxus_fail_tol_factor"]
 
-        self.length = hyperparams["length_init"]
+        self.length_init = hyperparams["length_init"]
+        self.length = self.length_init
         self.length_min = hyperparams["length_min"]
         self.length_max = hyperparams["length_max"]
 
@@ -1007,8 +1081,9 @@ class BAXUS:
         self.gp_model = None
         self.gp_likelihood = None
 
-        self.TRAIN_INTERVAL = hyperparams["baxus_train_interval"]
         self.GP_TRAIN_STEPS = hyperparams["n_training_steps"]
+
+        self.verbose = verbose  # Ensure verbose flag is set
 
     def _fail_tol(self):
         """
@@ -1026,9 +1101,9 @@ class BAXUS:
         Z_init = self.rng.uniform(-1.0, 1.0, size=(self.n_init, self.target_dim))
         X_up = self.projector.project_up(Z_init)
 
-        # Map [-1,1] to [0,1] then to [lb, ub]
-        X_mapped = 0.5 * (X_up + 1.0)
-        X_mapped = X_mapped * (self.ub - self.lb) + self.lb
+        # Correct and consistent mapping
+        X_mapped = 0.5 * (X_up + 1.0)  # Scale from [-1, 1] to [0, 1]
+        X_mapped = X_mapped * (self.ub - self.lb) + self.lb  # Scale to [lb, ub]
 
         fvals = np.array([self.f(x_) for x_ in X_mapped]).reshape(-1, 1)
 
@@ -1043,7 +1118,7 @@ class BAXUS:
             self.best_x = self.X[idx_best].copy()
 
         if self.verbose:
-            print(f"Initializing with {self.n_init} points. Best f: {self.best_f:.4f}")
+            print(f"Initialized with {self.n_init} points. Best f: {self.best_f:.4f}")
 
     def _update_trust_region(self, fX_batch):
         """
@@ -1052,19 +1127,30 @@ class BAXUS:
         Parameters:
         - fX_batch (np.ndarray): Latest function evaluations of shape (batch_size, 1)
         """
-        if np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f):
+        improvement = np.min(fX_batch) < self.best_f - 1e-3 * abs(self.best_f)
+        if improvement:
             self.success_count += 1
             self.fail_count = 0
+            if self.verbose:
+                print(f"Success count increased to {self.success_count}")
         else:
             self.fail_count += 1
             self.success_count = 0
+            if self.verbose:
+                print(f"Fail count increased to {self.fail_count}")
 
         if self.success_count >= self.success_tol:
+            old_length = self.length
             self.length = min(self.length * 2.0, self.length_max)
             self.success_count = 0
+            if self.verbose:
+                print(f"Expanding trust region from {old_length:.4f} to {self.length:.4f}")
         if self.fail_count >= self._fail_tol():
+            old_length = self.length
             self.length = max(self.length / 2.0, self.length_min)
             self.fail_count = 0
+            if self.verbose:
+                print(f"Shrinking trust region from {old_length:.4f} to {self.length:.4f}")
 
     def _choose_splitting_dims(self):
         """
@@ -1093,16 +1179,33 @@ class BAXUS:
         old_td = self.target_dim
         self.target_dim = self.projector.target_dim
 
-        # Reset the trust region and data
-        self.Z = np.zeros((0, self.target_dim))
-        self.X = np.zeros((0, self.dim))
-        self.fX = np.zeros((0, 1))
-        self.n_evals = 0
-        self.best_f = float('inf')
-        self.best_x = None
+        # Augment Z with new dimensions without resetting n_evals
+        n_existing = self.Z.shape[0]
+        n_new = self.target_dim - old_td
+        if n_new > 0 and n_existing > 0:
+            new_Z = self.rng.uniform(-1.0, 1.0, size=(n_existing, n_new))
+            self.Z = np.hstack([self.Z, new_Z])
+        elif n_new > 0 and n_existing == 0:
+            # If no existing points, initialize Z
+            Z_init = self.rng.uniform(-1.0, 1.0, size=(self.n_init, self.target_dim))
+            self.Z = np.vstack([self.Z, Z_init])
+            X_up = self.projector.project_up(Z_init)
+            X_mapped = 0.5 * (X_up + 1.0)  # Scale from [-1, 1] to [0, 1]
+            X_mapped = X_mapped * (self.ub - self.lb) + self.lb  # Scale to [lb, ub]
+            fvals = np.array([self.f(x_) for x_ in X_mapped]).reshape(-1, 1)
+            self.X = np.vstack([self.X, X_mapped])
+            self.fX = np.vstack([self.fX, fvals])
+            self.n_evals += self.n_init
+            idx_best = np.argmin(self.fX)
+            if self.fX[idx_best, 0] < self.best_f:
+                self.best_f = float(self.fX[idx_best, 0])
+                self.best_x = self.X[idx_best].copy()
+
+        # Reset trust region length
         self.length = self.length_init
 
-        self._initialize()
+        if self.verbose:
+            print(f"Split dimensions. New target dimensionality: {self.target_dim}")
 
     def _create_candidates_and_select(self):
         """
@@ -1111,9 +1214,6 @@ class BAXUS:
         Returns:
         - Z_selected (np.ndarray): Selected latent points of shape (batch_size, target_dim)
         """
-        if self.gp_model is None or self.gp_likelihood is None:
-            raise ValueError("GP model and likelihood must be trained before creating candidates.")
-
         i_best = np.argmin(self.fX)
         z_best = self.Z[i_best:i_best+1, :]
 
@@ -1154,50 +1254,54 @@ class BAXUS:
     def optimize(self):
         """
         Run the optimization process until the evaluation budget is exhausted.
-        
+
         Returns:
         - best_x (np.ndarray): Best found input
         - best_f (float): Best found function value
         """
         self._initialize()
 
-        while self.n_evals < self.max_evals and self.length > self.length_min:
-            # Retrain GP every TRAIN_INTERVAL steps or if GP not trained yet
-            if (self.n_evals == self.n_init) or (self.n_evals % self.TRAIN_INTERVAL == 0) or (self.gp_model is None):
-                train_x = torch.tensor(self.Z, dtype=torch.float32)
-                train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
-                self.gp_model, self.gp_likelihood = train_gp(
-                    train_x=train_x,
-                    train_y=train_y,
-                    use_ard=self.use_ard,
-                    num_steps=self.GP_TRAIN_STEPS,
-                    device=train_x.device,
-                    dtype=train_x.dtype
-                )
-                # Possibly split dimension
-                if self.target_dim < self.dim and self.success_count == 0 and self.fail_count == 0:
-                    dims_and_bins = self._choose_splitting_dims()
-                    if dims_and_bins:
-                        self._split_dimensions(dims_and_bins)
-                        # Re-train after splitting
-                        train_x = torch.tensor(self.Z, dtype=torch.float32)
-                        train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
-                        self.gp_model, self.gp_likelihood = train_gp(
-                            train_x=train_x,
-                            train_y=train_y,
-                            use_ard=self.use_ard,
-                            num_steps=self.GP_TRAIN_STEPS,
-                            device=train_x.device,
-                            dtype=train_x.dtype
-                        )
+        while self.n_evals < self.max_evals:
+            # Retrain GP every iteration
+            train_x = torch.tensor(self.Z, dtype=torch.float32)
+            train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
+            self.gp_model, self.gp_likelihood = train_gp(
+                train_x=train_x,
+                train_y=train_y,
+                use_ard=self.use_ard,
+                num_steps=self.GP_TRAIN_STEPS,
+                device=train_x.device,
+                dtype=train_x.dtype
+            )
+            if self.verbose:
+                print(f"GP retrained at evaluation {self.n_evals}")
+
+            # Possibly split dimension
+            if self.target_dim < self.dim and self.success_count == 0 and self.fail_count == 0:
+                dims_and_bins = self._choose_splitting_dims()
+                if dims_and_bins:
+                    self._split_dimensions(dims_and_bins)
+                    # Retrain GP after splitting
+                    train_x = torch.tensor(self.Z, dtype=torch.float32)
+                    train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
+                    self.gp_model, self.gp_likelihood = train_gp(
+                        train_x=train_x,
+                        train_y=train_y,
+                        use_ard=self.use_ard,
+                        num_steps=self.GP_TRAIN_STEPS,
+                        device=train_x.device,
+                        dtype=train_x.dtype
+                    )
+                    if self.verbose:
+                        print(f"GP retrained after dimension splitting at evaluation {self.n_evals}")
 
             # Generate and select candidates
             Z_next = self._create_candidates_and_select()
             X_up = self.projector.project_up(Z_next)
 
-            # Map [-1,1] to [0,1] then to [lb, ub]
-            X_mapped = 0.5 * (X_up + 1.0)
-            X_mapped = X_mapped * (self.lb - self.lb) + self.ub - self.lb  # Corrected scaling
+            # Corrected mapping from latent to original space
+            X_mapped = 0.5 * (X_up + 1.0)  # Scale from [-1, 1] to [0, 1]
+            X_mapped = X_mapped * (self.ub - self.lb) + self.lb  # Scale to [lb, ub]
 
             # Evaluate new points
             fX_next = np.array([self.f(x_) for x_ in X_mapped]).reshape(-1, 1)
@@ -1213,14 +1317,23 @@ class BAXUS:
             if min_batch < self.best_f:
                 self.best_f = float(min_batch)
                 self.best_x = X_mapped[np.argmin(fX_next)].copy()
+                if self.verbose:
+                    print(f"({self.n_evals}) New best f: {self.best_f}")
 
             # Update trust region
             self._update_trust_region(fX_next)
 
-            if self.verbose:
-                print(f"Evaluated {self.n_evals}/{self.max_evals} points. Best f: {self.best_f:.4f}")
+            # Safeguard: Ensure trust region length does not fall below minimum
+            if self.length < self.length_min:
+                self.length = self.length_min
+                if self.verbose:
+                    print(f"Trust region length reached minimum: {self.length_min}")
+
+        if self.verbose:
+            print(f"Optimization completed. Best f: {self.best_f} at evaluation {self.n_evals}")
 
         return self.best_x, self.best_f
+
 
 # ============ Benchmark Loop ============
 
@@ -1317,11 +1430,13 @@ def main():
     Main function to run benchmarking experiments across different methods, functions, instances, and dimensions.
     Saves runtime results and generates a runtime comparison plot.
     """
+    np.random.seed(42)
+    torch.manual_seed(42)
     # Example BBOB test set
-    fids = [15]  # List of function IDs
+    fids = [1,8,12,15,21]  # List of function IDs
     instances = [0, 1, 2]  # List of instances
-    dimensions = [40]  # List of dimensions
-    methods = ["turbo_pca", "turbo_only", "pca_only", "baxus"]
+    dimensions = [2,10,40,100]  # List of dimensions
+    methods = ["baxus", "turbo_pca", "turbo_only", "pca_only"]  # List of methods
     n_reps = 5
     budget_multiplier = SHARED_PARAMS["max_evals_multiplier"]
 
@@ -1347,7 +1462,7 @@ def main():
                         dimension=dim,
                         n_reps=n_reps,
                         budget_multiplier=budget_multiplier,
-                        verbose=True
+                        verbose=False
                     )
                     runtime_results[(m, fid, inst, dim)] = avg_time
 
@@ -1375,7 +1490,7 @@ def main():
         height = bar.get_height()
         plt.annotate(f'{height:.2f}',
                      xy=(bar.get_x() + bar.get_width() / 2, height),
-                     xytext=(0, 3),  # 3 points vertical offset
+                     xytext=(0, 3),  
                      textcoords="offset points",
                      ha='center', va='bottom')
 

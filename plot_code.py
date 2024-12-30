@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-
+###this code was generated with some help from chatgpt - as we did not find it critical to write this code from scratch
 import os
 import glob
 import pandas as pd
@@ -9,14 +8,12 @@ from collections import defaultdict
 from tqdm import tqdm
 import re
 
-# ===================== Helper Functions =====================
-
-def find_dat_files(root_dir):
-    pattern = os.path.join(root_dir, "data-*-f*-dim*", "ioh_data-*/data_f*_*", "IOHprofiler_f*_DIM*.dat")
+def find_dat_files():
+    pattern = os.path.join("data-*-f*-dim*", "ioh_data-*/data_f*_*", "IOHprofiler_f*_DIM*.dat")
     dat_files = glob.glob(pattern, recursive=True)
 
     parsed_files = []
-    run_counter = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # dim -> fid -> method -> count
+    run_counter = defaultdict(lambda: defaultdict(lambda: defaultdict(int))) 
 
     for file_path in dat_files:
         parts = file_path.split(os.sep)
@@ -113,7 +110,7 @@ def aggregate_runs(parsed_files, budget_multiplier=10):
 
     common_evals_per_dim = {dim: np.arange(1, max_evals_per_dim[dim] + 1) for dim in max_evals_per_dim}
 
-    for method, fid, dim, instance, repetition, file_path in tqdm(parsed_files, desc="Aggregating runs"):
+    for method, fid, dim, _, _, file_path in tqdm(parsed_files, desc="Aggregating runs"):
         evals, raw_y = read_dat_file(file_path, problematic_files)
         if evals is None or raw_y is None:
             continue
@@ -159,6 +156,15 @@ def plot_aggregated_performance(avg_data, common_evals_per_dim, output_dir):
         fig.suptitle(f"Performance Comparison for Dimension {dim}", fontsize=16)
 
         common_evals = common_evals_per_dim[dim]
+        all_methods = set()
+
+        # First pass to collect all methods for the legend
+        for fid in fids:
+            methods = sorted(avg_data[dim][fid].keys())
+            all_methods.update(methods)
+        
+        all_methods = sorted(all_methods)
+        method_colors = {method: None for method in all_methods}  # To store colors for consistency
 
         for idx, fid in enumerate(fids):
             row = idx // cols
@@ -168,16 +174,18 @@ def plot_aggregated_performance(avg_data, common_evals_per_dim, output_dir):
             methods = sorted(avg_data[dim][fid].keys())
             for method in methods:
                 avg_best_f = avg_data[dim][fid][method]
-                ax.plot(common_evals, avg_best_f, label=method)
+                line, = ax.plot(common_evals, avg_best_f, label=method)
+                if method_colors[method] is None:
+                    method_colors[method] = line.get_color()
 
             ax.set_xlabel("Evaluations")
             ax.set_ylabel("Best f so far")
-            ax.set_xscale('linear')  # Set x-axis to linear scale
-            ax.set_yscale('log')     # Y-axis remains logarithmic
+            ax.set_xscale('linear')  
+            ax.set_yscale('log')     
             ax.set_title(f"Function f{fid}")
-            ax.legend()
             ax.grid(True, which="both", ls="--", linewidth=0.5, alpha=0.7)
 
+        # Remove unused subplots
         total_subplots = rows * cols
         if num_fids < total_subplots:
             for idx in range(num_fids, total_subplots):
@@ -185,7 +193,12 @@ def plot_aggregated_performance(avg_data, common_evals_per_dim, output_dir):
                 col = idx % cols
                 fig.delaxes(axes[row][col])
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        # Create a centralized legend
+        handles = [plt.Line2D([0], [0], color=method_colors[method], label=method) for method in all_methods]
+        fig.legend(handles=handles, loc='lower center', ncol=len(all_methods), fontsize='small')
+
+        # Adjust layout to make space for the legend
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
 
         plot_filename = f"aggregated_performance_dim{dim}"
         save_path = os.path.join(output_dir, f"{plot_filename}.png")
@@ -193,26 +206,14 @@ def plot_aggregated_performance(avg_data, common_evals_per_dim, output_dir):
 
         plt.close()
 
-# ===================== Main Function =====================
-
 def main():
-    root_dir = '.'  # Current directory
     output_dir = 'aggregated_plots'
 
-    parsed_files = find_dat_files(root_dir)
-
-    if not parsed_files:
-        return
+    parsed_files = find_dat_files()
 
     data, common_evals_per_dim = aggregate_runs(parsed_files)
 
-    if not data:
-        return
-
     avg_data = compute_average_best_f(data)
-
-    if not avg_data:
-        return
 
     plot_aggregated_performance(avg_data, common_evals_per_dim, output_dir)
 
