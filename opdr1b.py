@@ -41,7 +41,7 @@ SHARED_PARAMS = {
     # TuRBO trust-region settings
     "length_init": 0.8,
     "length_min": 0.5 ** 7,
-    "length_max": 4.0,     # Increased from 1.6
+    "length_max": 3.2,     # Increased from 1.6
     "success_tol": 4,
     # GP training
     "n_training_steps": 50,
@@ -93,9 +93,6 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}, device=None, dtype
     - model (GP): Trained GP model
     - likelihood (GaussianLikelihood): Trained likelihood
     """
-    assert train_x.ndim == 2, "train_x must be a 2D tensor."
-    assert train_y.ndim == 1, "train_y must be a 1D tensor."
-    assert train_x.shape[0] == train_y.shape[0], "train_x and train_y must have the same number of samples."
 
     # Create hyperparameter bounds
     noise_constraint = Interval(5e-4, 0.2)
@@ -748,7 +745,7 @@ class TurboOnly:
                 # Reset trust region length
                 self.length = self.length_init
             else:
-                break  # No more evaluations or cannot restart
+                break  # No more evals
 
         return self.best_x, self.best_f
 
@@ -1107,8 +1104,6 @@ class BAXUS:
         Returns:
         - Z_selected (np.ndarray): Selected latent points of shape (batch_size, target_dim)
         """
-        if self.gp_model is None or self.gp_likelihood is None:
-            raise ValueError("GP model and likelihood must be trained before creating candidates.")
 
         i_best = np.argmin(self.fX)
         z_best = self.Z[i_best:i_best+1, :]
@@ -1193,7 +1188,7 @@ class BAXUS:
 
             # Map [-1,1] to [0,1] then to [lb, ub]
             X_mapped = 0.5 * (X_up + 1.0)
-            X_mapped = X_mapped * (self.lb - self.lb) + self.ub - self.lb  # Corrected scaling
+            X_mapped = X_mapped * (self.lb - self.lb) + self.ub - self.lb 
 
             # Evaluate new points
             fX_next = np.array([self.f(x_) for x_ in X_mapped]).reshape(-1, 1)
@@ -1368,7 +1363,7 @@ def main():
         height = bar.get_height()
         plt.annotate(f'{height:.2f}',
                      xy=(bar.get_x() + bar.get_width() / 2, height),
-                     xytext=(0, 3),  # 3 points vertical offset
+                     xytext=(0, 3),  
                      textcoords="offset points",
                      ha='center', va='bottom')
 
