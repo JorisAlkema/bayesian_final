@@ -17,7 +17,6 @@ import time
 import math
 import numpy as np
 import torch
-import gpytorch
 from torch.quasirandom import SobolEngine
 from sklearn.decomposition import PCA
 from scipy.stats import rankdata, qmc
@@ -36,9 +35,9 @@ from gpytorch.models import ExactGP
 SHARED_PARAMS = {
     # Generic BO hyperparams
     "n_init": 10,          # Number of initial points
-    "batch_size": 8,
+    "batch_size": 32,
     "use_ard": True,
-    "pca_components": 4,  # For PCA-based methods
+    "pca_components": 2,  # For PCA-based methods
     # TuRBO trust-region settings
     "length_init": 0.8,
     "length_min": 0.5 ** 7,
@@ -46,7 +45,7 @@ SHARED_PARAMS = {
     "success_tol": 4,
     # GP training
     "n_training_steps": 50,
-    "lr": 0.005,
+    "lr": 0.005, 
     # Candidate set
     # Logic: n_cand = min(100*d, 2500) kept inside each class
     # BAXUS-specific
@@ -54,7 +53,7 @@ SHARED_PARAMS = {
     "baxus_fail_tol_factor": 4.0,
     "baxus_init_target_dim": 5,
     "baxus_seed": 0,
-    "max_evals_multiplier": 10,  # Used to calculate max_evals
+    "max_evals_multiplier": 5,  # Used to calculate max_evals
 }
 
 # ======================== Correct GP Implementation ========================
@@ -504,8 +503,6 @@ class TuRBO_PCA_BO:
 
         return self.best_x, self.best_f
 
-# ================== Standalone TuRBO (TurboOnly) with Proper Restart Mechanism ==================
-
 class TurboOnly:
     """
     Standalone TuRBO (Trust Region Bayesian Optimization) implementation.
@@ -535,13 +532,14 @@ class TurboOnly:
         self.length_min = hyperparams["length_min"]
         self.length_max = hyperparams["length_max"]
         self.success_tol = hyperparams["success_tol"]
-        self.fail_tol = np.ceil(max(4.0 / self.batch_size, self.dim / self.batch_size))
+        self.fail_tol = math.ceil(max(4.0 / self.batch_size, self.dim / self.batch_size))  # Derived from original
         self.lr = hyperparams["lr"]
         self.n_training_steps = hyperparams["n_training_steps"]
+        self.use_ard = hyperparams["use_ard"] 
 
         # Data storage
-        self.X = np.zeros((0, self.dim))
-        self.fX = np.zeros((0, 1))
+        self.X = np.empty((0, self.dim))
+        self.fX = np.empty((0, 1))
         self.best_x = None
         self.best_f = float('inf')
         self.n_evals = 0
@@ -550,7 +548,7 @@ class TurboOnly:
         self.fail_count = 0
 
         # Candidate set size
-        self.n_cand = min(100 * self.dim, 2500)
+        self.n_cand = min(100 * self.dim, 5000)
 
         # Current trust region length
         self.length = self.length_init
@@ -653,14 +651,14 @@ class TurboOnly:
 
         # Train GP on local points
         train_x = torch.tensor(X_local, dtype=torch.float32)
-        train_y = torch.tensor(f_local.ravel(), dtype=torch.float32)
+        train_y = torch.tensor(f_local, dtype=torch.float32)
         gp_model, gp_likelihood = train_gp(
             train_x=train_x,
             train_y=train_y,
-            use_ard=self.use_ard,
+            use_ard=self.use_ard,  # Correctly reference self.use_ard
             num_steps=self.n_training_steps,
-            device=train_x.device,
-            dtype=train_x.dtype
+            device='cpu' if not torch.cuda.is_available() else 'cuda',
+            dtype=torch.float32
         )
 
         # Generate candidate points using Sobol sequence
@@ -704,7 +702,7 @@ class TurboOnly:
     def optimize(self):
         """
         Run the optimization process until the evaluation budget is exhausted.
-        
+
         Returns:
         - best_x (np.ndarray): Best found input
         - best_f (float): Best found function value
@@ -720,8 +718,7 @@ class TurboOnly:
                 f_scaled = self.fX.ravel()
 
                 # Generate next candidates
-                X_next_scaled = self._create_candidates(X_scaled, f_scaled)
-                X_next = from_unit_cube(X_next_scaled, self.lb, self.ub)
+                X_next = self._create_candidates(X_scaled, f_scaled)
 
                 # Evaluate new points
                 fX_next = np.array([self.f(xnew) for xnew in X_next]).reshape(-1, 1)
@@ -982,7 +979,8 @@ class BAXUS:
         self.success_tol = hyperparams["success_tol"]
         self.fail_tol_factor = hyperparams["baxus_fail_tol_factor"]
 
-        self.length = hyperparams["length_init"]
+        self.length_init = hyperparams["length_init"]  # **Added this line**
+        self.length = self.length_init
         self.length_min = hyperparams["length_min"]
         self.length_max = hyperparams["length_max"]
 
@@ -1042,8 +1040,6 @@ class BAXUS:
             self.best_f = float(self.fX[idx_best, 0])
             self.best_x = self.X[idx_best].copy()
 
-        if self.verbose:
-            print(f"Initializing with {self.n_init} points. Best f: {self.best_f:.4f}")
 
     def _update_trust_region(self, fX_batch):
         """
@@ -1216,9 +1212,6 @@ class BAXUS:
 
             # Update trust region
             self._update_trust_region(fX_next)
-
-            if self.verbose:
-                print(f"Evaluated {self.n_evals}/{self.max_evals} points. Best f: {self.best_f:.4f}")
 
         return self.best_x, self.best_f
 
