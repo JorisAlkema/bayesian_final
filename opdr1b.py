@@ -35,7 +35,7 @@ from gpytorch.models import ExactGP
 SHARED_PARAMS = {
     # Generic BO hyperparams
     "n_init": 10,          # Number of initial points
-    "batch_size": 32,
+    "batch_size": 16,
     "use_ard": True,
     "pca_components": 2,  # For PCA-based methods
     # TuRBO trust-region settings
@@ -49,11 +49,11 @@ SHARED_PARAMS = {
     # Candidate set
     # Logic: n_cand = min(100*d, 2500) kept inside each class
     # BAXUS-specific
-    "baxus_train_interval": 5,  # Only train GP every 5 steps
+    "baxus_train_interval": 2,  # Only train GP every 5 steps
     "baxus_fail_tol_factor": 4.0,
     "baxus_init_target_dim": 5,
     "baxus_seed": 0,
-    "max_evals_multiplier": 5,  # Used to calculate max_evals
+    "max_evals_multiplier": 10,  # Used to calculate max_evals
 }
 
 # ======================== Correct GP Implementation ========================
@@ -1306,7 +1306,7 @@ def main():
     Saves runtime results and generates a runtime comparison plot.
     """
     # Example BBOB test set
-    fids = [15]  # List of function IDs
+    fids = [1,8,12,15,21]  # List of function IDs
     instances = [0, 1, 2]  # List of instances
     dimensions = [40]  # List of dimensions
     methods = ["turbo_pca", "turbo_only", "pca_only", "baxus"]
