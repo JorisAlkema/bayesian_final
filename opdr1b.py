@@ -35,7 +35,7 @@ from gpytorch.models import ExactGP
 SHARED_PARAMS = {
     # Generic BO hyperparams
     "n_init": 10,          # Number of initial points
-    "batch_size": 32,
+    "batch_size": 5,
     "use_ard": True,
     "pca_components": 2,  # For PCA-based methods
     # TuRBO trust-region settings
@@ -49,7 +49,7 @@ SHARED_PARAMS = {
     # Candidate set
     # Logic: n_cand = min(100*d, 2500) kept inside each class
     # BAXUS-specific
-    "baxus_train_interval": 5,  # Only train GP every 5 steps
+    "baxus_train_interval": 1,  # Only train GP every 5 steps
     "baxus_fail_tol_factor": 4.0,
     "baxus_init_target_dim": 5,
     "baxus_seed": 0,
@@ -1296,7 +1296,7 @@ class BAXUS:
                 self.best_f = float(min_batch)
                 self.best_x = X_mapped[np.argmin(fX_next)].copy()
                 if self.verbose:
-                    print(f"New best f: {self.best_f} at evaluation {self.n_evals}")
+                    print(f"({self.n_evals}) New best f: {self.best_f}")
 
             # Update trust region
             self._update_trust_region(fX_next)
@@ -1408,11 +1408,11 @@ def main():
     Saves runtime results and generates a runtime comparison plot.
     """
     # Example BBOB test set
-    fids = [21]  # List of function IDs
+    fids = [1,8,12,15,21]  # List of function IDs
     instances = [0, 1, 2]  # List of instances
-    dimensions = [10]  # List of dimensions
-    methods = ["turbo_pca", "turbo_only", "pca_only", "baxus"]
-    n_reps = 5
+    dimensions = [40]  # List of dimensions
+    methods = ["baxus"]
+    n_reps = 1
     budget_multiplier = SHARED_PARAMS["max_evals_multiplier"]
 
     total_runs = len(fids) * len(instances) * len(dimensions) * len(methods)
@@ -1437,7 +1437,7 @@ def main():
                         dimension=dim,
                         n_reps=n_reps,
                         budget_multiplier=budget_multiplier,
-                        verbose=False
+                        verbose=True
                     )
                     runtime_results[(m, fid, inst, dim)] = avg_time
 
