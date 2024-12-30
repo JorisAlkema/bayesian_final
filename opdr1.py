@@ -1,15 +1,11 @@
-#!/usr/bin/env python3
-# File: opdr1_modified_sharedparams.py
+
 """
-Example script that:
-1) Implements a combined TuRBO + Weighted-PCA approach (LOCAL trust-region PCA).
-2) Includes 3 other baseline algorithms:
+1) Combined TuRBO + Weighted-PCA approach (LOCAL trust-region PCA).
+2) Baselines:
     - Standalone TuRBO
     - Standalone PCA-BO
     - BAXUS
-3) Benchmarks them on selected BBOB problems via the `ioh` package
-4) Saves results for IOHanalyzer
-5) Plots runtime comparisons among the 4 methods.
+3) Plots runtime comparisons among the 4 methods.
 """
 
 import sys
@@ -31,7 +27,6 @@ from gpytorch.means import ConstantMean
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.models import ExactGP
 
-# ====================== SHARED HYPERPARAMETERS =====================
 SHARED_PARAMS = {
     # Generic BO hyperparams
     "n_init": 10,          # Number of initial points
@@ -55,7 +50,6 @@ SHARED_PARAMS = {
 
 }
 
-# ======================== Correct GP Implementation ========================
 
 class GP(ExactGP):
     """
@@ -141,13 +135,12 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}, device=None, dtype
         loss.backward()
         optimizer.step()
 
-    # Switch to evaluation mode
+    # Switch to evaluation mode - do we need this??
     model.eval()
     likelihood.eval()
 
     return model, likelihood
 
-# ======================== Helpers for Scaling & PCA =========================
 
 def to_unit_cube(X, lb, ub):
     """
@@ -229,7 +222,6 @@ def _apply_pca_unweighted(X_reduced, pca, X_mean):
     
     return X_original
 
-
 def latin_hypercube(n_samples, dim):
     """
     Generate samples using the Latin Hypercube Sampling method.
@@ -244,10 +236,6 @@ def latin_hypercube(n_samples, dim):
     sampler = qmc.LatinHypercube(d=dim)
     sample = sampler.random(n=n_samples)
     return sample
-
-# ================== TuRBO_PCA_BO Class with Proper Restart Mechanism ==================
-
-
 
 class TuRBO_PCA_BO:
     """
@@ -272,24 +260,24 @@ class TuRBO_PCA_BO:
         self.dim = len(lb)
 
         # Unpack shared hyperparams with default values
-        self.n_init = hyperparams.get("n_init", 2 * self.dim)
-        self.max_evals = hyperparams.get("max_evals_multiplier", 10) * self.dim
-        self.batch_size = hyperparams.get("batch_size", 1)
-        self.use_ard = hyperparams.get("use_ard", True)
-        self.pca_components = hyperparams.get("pca_components", min(5, self.dim))
-        self.length_init = hyperparams.get("length_init", 0.8)
-        self.length_min = hyperparams.get("length_min", 0.5 ** 7)
-        self.length_max = hyperparams.get("length_max", 1.6)
-        self.success_tol = hyperparams.get("success_tol", 3)
+        self.n_init = hyperparams["n_init"]
+        self.max_evals = hyperparams["max_evals_multiplier"] * self.dim
+        self.batch_size = hyperparams["batch_size"]
+        self.use_ard = hyperparams["use_ard"]
+        self.pca_components = hyperparams["pca_components"]
+        self.length_init = hyperparams["length_init"]
+        self.length_min = hyperparams["length_min"]
+        self.length_max = hyperparams["length_max"]
+        self.success_tol = hyperparams["success_tol"]
         self.fail_tol = math.ceil(max(4.0 / self.batch_size, self.dim / self.batch_size))
-        self.lr = hyperparams.get("lr", 0.01)
-        self.n_training_steps = hyperparams.get("n_training_steps", 50)
+        self.lr = hyperparams["lr"]
+        self.n_training_steps = hyperparams["n_training_steps"]
         self.verbose = verbose
-        self.seed = hyperparams.get("sobol_seed", 0)
+        self.seed = hyperparams["sobol_seed"]
 
         # Device and dtype for GPyTorch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = torch.float32  # Consistently use float32
+        self.dtype = torch.float32  
 
         if self.verbose:
             print(f"Using device: {self.device}, dtype: {self.dtype}")
@@ -337,7 +325,6 @@ class TuRBO_PCA_BO:
             self.success_count = 0
             self.fail_count = 0
         else:
-            # Initial initialization: Latin Hypercube Sampling
             X_init = latin_hypercube(self.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
             f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
@@ -381,6 +368,7 @@ class TuRBO_PCA_BO:
             self.success_count = 0
             if self.verbose:
                 print(f"Expanding trust region from {old_length:.4f} to {self.length:.4f}")
+
         if self.fail_count >= self.fail_tol:
             old_length = self.length
             self.length = max(self.length / 2.0, self.length_min)
@@ -404,20 +392,15 @@ class TuRBO_PCA_BO:
         sigma = 1.0 if sigma < 1e-6 else sigma
         f_standardized = (f_scaled - mu) / sigma
 
-        if self.verbose:
-            print("Performing Weighted PCA on local points...")
         
         # Perform Weighted PCA
         pca, X_reduced_local, X_mean = _weighted_pca(X_scaled, f_standardized, self.pca_components)
 
-        if self.verbose:
-            print(f"PCA completed. Reduced to {self.pca_components} components.")
 
         # Train GP on reduced and standardized data
         train_x = torch.tensor(X_reduced_local, dtype=self.dtype).to(self.device)
         train_y = torch.tensor(f_standardized, dtype=self.dtype).to(self.device)
-        if self.verbose:
-            print("Training GP on reduced and standardized data...")
+
         gp_model, gp_likelihood = train_gp(
             train_x=train_x,
             train_y=train_y,
@@ -427,10 +410,7 @@ class TuRBO_PCA_BO:
             device=self.device,
             dtype=self.dtype
         )
-        if self.verbose:
-            print("GP training completed.")
 
-        # Update hyperparameters
         self.hypers = gp_model.state_dict()
 
         # Generate candidate points using Sobol sequence in reduced space
@@ -451,9 +431,6 @@ class TuRBO_PCA_BO:
         X_cand_masked[mask] = X_cand_reduced[mask]
         X_cand_reduced = X_cand_masked
 
-        if self.verbose:
-            print("Evaluating GP predictions on candidate points...")
-
         # Evaluate GP predictions on candidates
         gp_model.eval()
         gp_likelihood.eval()
@@ -470,9 +447,6 @@ class TuRBO_PCA_BO:
 
         # Inverse PCA to original space
         X_cand_selected_original = _apply_pca_unweighted(X_cand_selected_reduced, pca, X_mean)
-
-        if self.verbose:
-            print(f"Selected {self.batch_size} candidate points.")
 
         return X_cand_selected_original
 
@@ -493,7 +467,7 @@ class TuRBO_PCA_BO:
         - best_x (np.ndarray): Best found input
         - best_f (float): Best found function value
         """
-        # Initial optimization
+        
         self.length = self.length_init
         self.initialize(restart=False)
 
@@ -564,18 +538,18 @@ class TurboOnly:
         self.dim = len(lb)
 
         # Unpack shared hyperparams
-        self.n_init = hyperparams.get("n_init", 2 * self.dim)
-        self.max_evals = hyperparams.get("max_evals_multiplier", 10) * self.dim
-        self.batch_size = hyperparams.get("batch_size", 1)
-        self.length_init = hyperparams.get("length_init", 0.8)
-        self.length_min = hyperparams.get("length_min", 0.5 ** 7)
-        self.length_max = hyperparams.get("length_max", 1.6)
-        self.success_tol = hyperparams.get("success_tol", 3)
+        self.n_init = hyperparams["n_init"]
+        self.max_evals = hyperparams["max_evals_multiplier"] * self.dim
+        self.batch_size = hyperparams["batch_size"]
+        self.length_init = hyperparams["length_init"]
+        self.length_min = hyperparams["length_min"]
+        self.length_max = hyperparams["length_max"]
+        self.success_tol = hyperparams["success_tol"]
         self.fail_tol = math.ceil(max(4.0 / self.batch_size, self.dim / self.batch_size))
-        self.lr = hyperparams.get("lr", 0.01)
-        self.n_training_steps = hyperparams.get("n_training_steps", 50)
-        self.use_ard = hyperparams.get("use_ard", True)
-        self.seed = hyperparams.get("sobol_seed", 0)
+        self.lr = hyperparams["lr"]
+        self.n_training_steps = hyperparams["n_training_steps"]
+        self.use_ard = hyperparams["use_ard"]
+        self.seed = hyperparams["sobol_seed"]
 
         # Data storage
         self.X = np.empty((0, self.dim))
@@ -604,7 +578,7 @@ class TurboOnly:
         - restart (bool): If True, replaces existing data with new samples.
         """
         if restart:
-            # Restart: Sample new initial points using Latin Hypercube
+            # Restart: Sample new points 
             X_init = latin_hypercube(self.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
             f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
@@ -617,12 +591,11 @@ class TurboOnly:
             self.success_count = 0
             self.fail_count = 0
         else:
-            # Initial initialization: Latin Hypercube Sampling
             X_init = latin_hypercube(self.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
             f_init = np.array([self.f(x) for x in X_init]).reshape(-1, 1)
 
-            # Append during initial initialization
+            # append
             self.X = np.vstack([self.X, X_init])
             self.fX = np.vstack([self.fX, f_init])
 
@@ -661,6 +634,7 @@ class TurboOnly:
             self.success_count = 0
             if self.verbose:
                 print(f"Expanding trust region from {old_length:.4f} to {self.length:.4f}")
+
         if self.fail_count >= self.fail_tol:
             old_length = self.length
             self.length = max(self.length / 2.0, self.length_min)
@@ -685,7 +659,6 @@ class TurboOnly:
         sigma = 1.0 if sigma < 1e-6 else sigma
         f_standardized = (f_scaled - mu) / sigma
 
-        # Train GP on standardized data
         train_x = torch.tensor(X_scaled, dtype=torch.float32)
         train_y = torch.tensor(f_standardized, dtype=torch.float32)
         gp_model, gp_likelihood = train_gp(
@@ -716,7 +689,7 @@ class TurboOnly:
             X_local = X_scaled
             f_local = f_scaled
 
-        # Retrain GP on potentially updated local points
+        # Retrain GP 
         train_x = torch.tensor(X_local, dtype=torch.float32)
         train_y = torch.tensor((f_local - mu) / sigma, dtype=torch.float32)
         gp_model, gp_likelihood = train_gp(
@@ -729,12 +702,12 @@ class TurboOnly:
             dtype=torch.float32
         )
 
-        # Generate candidate points using Sobol sequence
+        # Generate candidate points using Sobol 
         sobol = SobolEngine(self.dim, scramble=True)
         pert = sobol.draw(self.n_cand).numpy()
         X_cand = lb_tr + (ub_tr - lb_tr) * pert
 
-        # Apply probability-based perturbation
+        # Apply perturbation
         prob_perturb = min(20.0 / self.dim, 1.0)
         mask = np.random.rand(self.n_cand, self.dim) <= prob_perturb
         row_sum = np.sum(mask, axis=1)
@@ -747,7 +720,7 @@ class TurboOnly:
         X_cand_masked[mask] = X_cand[mask]
         X_cand = X_cand_masked
 
-        # Evaluate GP predictions on candidates
+        # Evaluate GP 
         gp_model.eval()
         gp_likelihood.eval()
         with torch.no_grad():
@@ -756,7 +729,7 @@ class TurboOnly:
             f_samps = dist.sample(torch.Size([1])).numpy().reshape(-1)
             f_samps = mu + sigma * f_samps  # Transform back to original scale
 
-        # Select the best candidates based on sampled function values
+        # Select the best candidates based on fucntion val
         idx_sorted = np.argsort(f_samps)
         best_inds = idx_sorted[:self.batch_size]
         X_cand_selected = X_cand[best_inds]
@@ -784,7 +757,7 @@ class TurboOnly:
         self.length = self.length_init
         self.initialize(restart=False)
 
-        hypers = {}  # Initialize hyperparameters
+        hypers = {}
 
         while self.n_evals < self.max_evals:
             while self.n_evals < self.max_evals and self.length > self.length_min:
@@ -795,7 +768,7 @@ class TurboOnly:
                 # Generate next candidates
                 X_next = self._create_candidates(X_scaled, f_scaled, hypers)
 
-                # Evaluate new points
+                # Eval new points
                 fX_next = np.array([self.f(xnew) for xnew in X_next]).reshape(-1, 1)
 
                 # Update data
@@ -811,10 +784,8 @@ class TurboOnly:
                     if self.verbose:
                         print(f"New best f: {self.best_f:.4f}")
 
-                # Update trust region
                 self._update_trust_region(fX_next)
 
-            # Check if restart is needed
             if self._restart_condition():
                 if self.verbose:
                     print(f"Restarting TuRBO: {self.n_evals}/{self.max_evals} evaluations used.")
@@ -826,8 +797,6 @@ class TurboOnly:
                 break  # No more evaluations or cannot restart
 
         return self.best_x, self.best_f
-
-# ================== Standalone PCA-BO (Simple) ==================
 
 class SimplePCABO:
     """
@@ -962,8 +931,6 @@ class SimplePCABO:
 
         return self.best_x, self.best_f
 
-# ================== AxUS & BAXUS Implementations ==================
-
 
 class AxUSProjector:
     """
@@ -1045,7 +1012,6 @@ class BAXUS:
         self.ub = ub
         self.dim = len(lb)
 
-        # Unpack shared hyperparams
         self.n_init = hyperparams["n_init"]
         self.max_evals = hyperparams["max_evals_multiplier"] * self.dim
         self.batch_size = hyperparams["batch_size"]
@@ -1064,7 +1030,6 @@ class BAXUS:
 
         self.rng = np.random.RandomState(hyperparams["baxus_seed"])
 
-        # Data storage
         self.X = np.zeros((0, self.dim))
         self.fX = np.zeros((0, 1))
         self.Z = np.zeros((0, self.target_dim))
@@ -1083,7 +1048,7 @@ class BAXUS:
 
         self.GP_TRAIN_STEPS = hyperparams["n_training_steps"]
 
-        self.verbose = verbose  # Ensure verbose flag is set
+        self.verbose = verbose  
 
     def _fail_tol(self):
         """
@@ -1101,7 +1066,6 @@ class BAXUS:
         Z_init = self.rng.uniform(-1.0, 1.0, size=(self.n_init, self.target_dim))
         X_up = self.projector.project_up(Z_init)
 
-        # Correct and consistent mapping
         X_mapped = 0.5 * (X_up + 1.0)  # Scale from [-1, 1] to [0, 1]
         X_mapped = X_mapped * (self.ub - self.lb) + self.lb  # Scale to [lb, ub]
 
@@ -1201,7 +1165,6 @@ class BAXUS:
                 self.best_f = float(self.fX[idx_best, 0])
                 self.best_x = self.X[idx_best].copy()
 
-        # Reset trust region length
         self.length = self.length_init
 
         if self.verbose:
@@ -1262,7 +1225,6 @@ class BAXUS:
         self._initialize()
 
         while self.n_evals < self.max_evals:
-            # Retrain GP every iteration
             train_x = torch.tensor(self.Z, dtype=torch.float32)
             train_y = torch.tensor(self.fX.ravel(), dtype=torch.float32)
             self.gp_model, self.gp_likelihood = train_gp(
@@ -1299,7 +1261,6 @@ class BAXUS:
             Z_next = self._create_candidates_and_select()
             X_up = self.projector.project_up(Z_next)
 
-            # Corrected mapping from latent to original space
             X_mapped = 0.5 * (X_up + 1.0)  # Scale from [-1, 1] to [0, 1]
             X_mapped = X_mapped * (self.ub - self.lb) + self.lb  # Scale to [lb, ub]
 
@@ -1335,8 +1296,6 @@ class BAXUS:
         return self.best_x, self.best_f
 
 
-# ============ Benchmark Loop ============
-
 def run_one_experiment(method_name, fid, instance, dimension, n_reps=5, budget_multiplier=10, verbose=False):
     """
     Runs one method on a single (fid, instance, dimension) problem for n_reps times.
@@ -1368,11 +1327,9 @@ def run_one_experiment(method_name, fid, instance, dimension, n_reps=5, budget_m
 
         max_evals = budget_multiplier * dimension
 
-        # Prepare hyperparams
         local_hp = SHARED_PARAMS.copy()
-        local_hp["max_evals"] = max_evals  # Override
+        local_hp["max_evals"] = max_evals  
 
-        # Start timing
         t0 = time.time()
 
         if method_name == "turbo_pca":
